@@ -8,77 +8,17 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch import Tensor
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from minivla import MiniVLAConfig, MiniVLAProcessor, MiniVLAPolicy
-from minivla.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from minivla.constants import ACTION, EPISODE_QUALITY, EPISODE_SUCCESS, FUTURE_IMAGE, SUBGOAL_IMAGE, SUBTASK_LABEL
+from minivla.transforms import BatchNormalizer, prepare_batch
 
 
 def _auto_device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def _to_tensor(value: Any, device: torch.device, dtype: torch.dtype = torch.float32) -> Tensor | None:
-    if value is None:
-        return None
-    if torch.is_tensor(value):
-        return value.to(device=device, dtype=dtype)
-    try:
-        return torch.as_tensor(value, device=device, dtype=dtype)
-    except (TypeError, ValueError):
-        return None
-
-
-def _stat_tensor(stats: dict[str, Any], key: str, name: str, device: torch.device) -> Tensor | None:
-    item = stats.get(key)
-    if not isinstance(item, dict):
-        return None
-    value = item.get(name)
-    if value is None and name == "std":
-        min_value = _to_tensor(item.get("min"), device)
-        max_value = _to_tensor(item.get("max"), device)
-        if min_value is not None and max_value is not None:
-            value = (max_value - min_value).clamp_min(1e-6)
-    return _to_tensor(value, device)
-
-
-class BatchNormalizer:
-    """Normalize state/action tensors from LeRobot-style dataset stats."""
-
-    def __init__(
-        self,
-        stats: dict[str, Any] | None,
-        device: torch.device,
-        normalize_state: bool = True,
-        normalize_action: bool = True,
-        eps: float = 1e-6,
-    ) -> None:
-        self.stats = stats or {}
-        self.device = device
-        self.normalize_state = normalize_state
-        self.normalize_action = normalize_action
-        self.eps = eps
-
-    def _normalize(self, tensor: Tensor, key: str) -> Tensor:
-        mean = _stat_tensor(self.stats, key, "mean", self.device)
-        std = _stat_tensor(self.stats, key, "std", self.device)
-        if mean is None or std is None:
-            return tensor
-        while mean.ndim < tensor.ndim:
-            mean = mean.unsqueeze(0)
-            std = std.unsqueeze(0)
-        return (tensor - mean.to(dtype=tensor.dtype)) / std.to(dtype=tensor.dtype).clamp_min(self.eps)
-
-    def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
-        out = dict(batch)
-        if self.normalize_state and OBS_STATE in out and torch.is_tensor(out[OBS_STATE]):
-            out[OBS_STATE] = self._normalize(out[OBS_STATE], OBS_STATE)
-        if self.normalize_action and ACTION in out and torch.is_tensor(out[ACTION]):
-            out[ACTION] = self._normalize(out[ACTION], ACTION)
-        return out
 
 
 def _collate_value(values: list[Any]) -> Any:
@@ -97,36 +37,6 @@ def _collate_value(values: list[Any]) -> Any:
 def collate_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     keys = samples[0].keys()
     return {key: _collate_value([sample[key] for sample in samples]) for key in keys}
-
-
-def move_tensors(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
-    out = dict(batch)
-    for key, value in list(out.items()):
-        if torch.is_tensor(value):
-            out[key] = value.to(device, non_blocking=True)
-    return out
-
-
-def prepare_batch(batch: dict[str, Any], device: torch.device, processor: MiniVLAProcessor, normalizer: BatchNormalizer) -> dict[str, Tensor]:
-    batch = move_tensors(batch, device)
-    batch = normalizer(batch)
-    batch = processor(batch, device=device)
-
-    if ACTION in batch and torch.is_tensor(batch[ACTION]) and batch[ACTION].ndim == 2:
-        batch[ACTION] = batch[ACTION].unsqueeze(1)
-
-    for key, value in list(batch.items()):
-        if key.startswith("observation.images") and torch.is_tensor(value):
-            if value.dtype == torch.uint8:
-                batch[key] = value.float().div(255.0)
-            elif not torch.is_floating_point(value):
-                batch[key] = value.float()
-
-    required = [OBS_STATE, ACTION, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK]
-    missing = [key for key in required if key not in batch]
-    if missing:
-        raise KeyError(f"Prepared batch is missing required keys: {missing}")
-    return batch
 
 
 def load_lerobot_dataset(args: argparse.Namespace):
@@ -192,6 +102,7 @@ def config_from_args(args: argparse.Namespace, checkpoint: dict[str, Any] | None
         "text_vocab_size": args.text_vocab_size,
         "tokenizer_max_length": args.tokenizer_max_length,
         "num_inference_steps": args.num_inference_steps,
+        "max_image_tokens": args.max_image_tokens,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -207,6 +118,7 @@ def save_checkpoint(
     epoch: int,
     config: MiniVLAConfig,
     stats: dict[str, Any],
+    assets: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -217,6 +129,7 @@ def save_checkpoint(
             "epoch": epoch,
             "config": asdict(config),
             "dataset_stats": stats,
+            "assets": assets,
         },
         path,
     )
@@ -273,6 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-vocab-size", type=int, default=49152)
     parser.add_argument("--tokenizer-max-length", type=int, default=48)
     parser.add_argument("--num-inference-steps", type=int, default=10)
+    parser.add_argument("--max-image-tokens", type=int, default=None)
     return parser
 
 
@@ -318,13 +232,29 @@ def main() -> None:
     )
 
     output_dir = Path(args.output_dir)
+    assets = {
+        "dataset_repo_id": args.dataset_repo_id,
+        "dataset_root": args.dataset_root,
+        "image_keys": list(config.image_keys),
+        "optional_metadata_keys": [
+            EPISODE_SUCCESS,
+            EPISODE_QUALITY,
+            SUBTASK_LABEL,
+            SUBGOAL_IMAGE,
+            FUTURE_IMAGE,
+        ],
+        "normalize_state": args.normalize_state,
+        "normalize_action": args.normalize_action,
+        "processor": "MiniVLAProcessor",
+        "tokenizer_name": config.tokenizer_name,
+    }
     max_steps = args.max_steps if args.max_steps is not None else math.inf
     step = start_step
 
     policy.train()
     for epoch in range(start_epoch, args.epochs):
         for raw_batch in dataloader:
-            batch = prepare_batch(raw_batch, device, processor, normalizer)
+            batch = prepare_batch(raw_batch, config, processor, normalizer, device=device)
             loss, info = policy(batch)
 
             optimizer.zero_grad(set_to_none=True)
@@ -337,13 +267,13 @@ def main() -> None:
             if step % args.log_every == 0:
                 print(f"step={step} epoch={epoch} loss={float(info['loss']):.6f}", flush=True)
             if args.save_every > 0 and step % args.save_every == 0:
-                save_checkpoint(output_dir / f"step_{step:08d}.pt", policy, optimizer, step, epoch, config, stats)
+                save_checkpoint(output_dir / f"step_{step:08d}.pt", policy, optimizer, step, epoch, config, stats, assets)
             if step >= max_steps:
                 break
         if step >= max_steps:
             break
 
-    save_checkpoint(output_dir / "last.pt", policy, optimizer, step, epoch, config, stats)
+    save_checkpoint(output_dir / "last.pt", policy, optimizer, step, epoch, config, stats, assets)
     print(f"saved checkpoint: {output_dir / 'last.pt'}")
 
 

@@ -38,6 +38,23 @@
   --use-checkpoint-config
 ```
 
+训练 checkpoint 会保存 `config`、`dataset_stats` 和 tokenizer/normalizer metadata。推理时可以用同一套 transform 路径恢复：
+
+```python
+from minivla import MiniVLAPolicyRunner
+
+runner = MiniVLAPolicyRunner.from_checkpoint("outputs/minivla/last.pt")
+actions = runner.infer(observation)["actions"]
+```
+
+也可以启动轻量 HTTP policy server：
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/serve_policy.py \
+  --checkpoint outputs/minivla/last.pt \
+  --port 8010
+```
+
 ## Minimal Usage
 
 ```python
@@ -79,11 +96,11 @@ batch["action_is_pad"] = torch.zeros(2, cfg.chunk_size, dtype=torch.bool)
 batch["action_is_pad"][0, -2:] = True
 ```
 
-`policy.fm_head` 可以单独使用：输入已经融合好的 context token，输出完整 padded action chunk：
+`policy.fm_head` 可以单独使用：输入 observation memory tokens，输出完整 padded action chunk：
 
 ```python
-context = policy.encode_context({k: v for k, v in batch.items() if k != ACTION})
-padded_actions = policy.fm_head.sample(context)
+obs_tokens = policy.encode_observation_tokens({k: v for k, v in batch.items() if k != ACTION})
+padded_actions = policy.fm_head.sample(obs_tokens)
 ```
 
 ## Notes

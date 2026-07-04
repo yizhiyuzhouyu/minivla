@@ -102,8 +102,8 @@ class HFVisionEncoder(nn.Module):
         return self.projector(tokens)
 
 
-class TextMeanPoolEncoder(nn.Module):
-    """Embedding + mask mean pooling + linear text encoder."""
+class TextTokenEncoder(nn.Module):
+    """Embedding + projection text encoder that preserves token-level language."""
 
     def __init__(self, config: MiniVLAConfig):
         super().__init__()
@@ -115,13 +115,12 @@ class TextMeanPoolEncoder(nn.Module):
             nn.Linear(config.hidden_dim, config.hidden_dim),
         )
 
-    def forward(self, tokens: Tensor, mask: Tensor | None = None) -> Tensor:
+    def forward(self, tokens: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         embedded = self.embedding(tokens)
         if mask is None:
             mask = torch.ones(tokens.shape, dtype=torch.bool, device=tokens.device)
-        mask = mask.to(dtype=embedded.dtype, device=embedded.device)
-        pooled = (embedded * mask[..., None]).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return self.proj(pooled)[:, None, :]
+        encoded = self.proj(embedded)
+        return encoded, mask.to(dtype=torch.bool, device=encoded.device)
 
 
 class StateEncoder(nn.Module):
@@ -145,14 +144,26 @@ class MiniVLAPolicy(nn.Module):
         super().__init__()
         self.config = config
         self.vision_encoder = HFVisionEncoder(config) if config.use_hf_vision_encoder else PatchVisionEncoder(config)
-        self.text_encoder = TextMeanPoolEncoder(config)
+        self.text_encoder = TextTokenEncoder(config)
         self.state_encoder = StateEncoder(config)
-        self.context_fusion = nn.Sequential(
-            nn.Linear(config.hidden_dim * 3, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
-            nn.GELU(),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
+        self.camera_embedding = nn.Embedding(max(1, len(config.image_keys)), config.hidden_dim)
+        self.image_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        self.text_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        self.state_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_dim,
+            nhead=config.num_heads,
+            dim_feedforward=int(config.hidden_dim * config.mlp_ratio),
+            dropout=config.dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
         )
+        self.observation_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=max(1, config.num_dit_layers // 2),
+        )
+        self.observation_norm = nn.LayerNorm(config.hidden_dim)
         self.fm_head = FMHead(config)
         self.action_expert = self.fm_head.action_expert
         self._queues: dict[str, deque[Tensor]] = {}
@@ -183,9 +194,9 @@ class MiniVLAPolicy(nn.Module):
         actions_raw = batch[ACTION]
         action_dim = min(actions_raw.shape[-1], self.config.max_action_dim)
         actions = pad_vector(actions_raw, self.config.max_action_dim).to(dtype=next(self.parameters()).dtype)
-        context = self.encode_context(batch)
+        obs_tokens = self.encode_observation_tokens(batch)
         return self.fm_head.loss(
-            context=context,
+            obs_tokens=obs_tokens,
             actions=actions,
             action_dim=action_dim,
             noise=noise,
@@ -218,31 +229,59 @@ class MiniVLAPolicy(nn.Module):
         num_steps: int | None = None,
     ) -> Tensor:
         self.eval()
-        context = self.encode_context(batch)
-        actions = self.fm_head.sample(context=context, noise=noise, num_steps=num_steps)
+        obs_tokens = self.encode_observation_tokens(batch)
+        actions = self.fm_head.sample(obs_tokens=obs_tokens, noise=noise, num_steps=num_steps)
         return actions[..., : self.config.action_dim]
 
     def encode_context(self, batch: dict[str, Tensor]) -> Tensor:
-        image_tokens = self.encode_images(batch)
-        image_token = image_tokens.mean(dim=1, keepdim=True)
+        return self.encode_observation_tokens(batch).mean(dim=1, keepdim=True)
 
+    def encode_observation_tokens(self, batch: dict[str, Tensor]) -> Tensor:
+        image_tokens = self.encode_images(batch)
+        if self.config.max_image_tokens is not None and image_tokens.shape[1] > self.config.max_image_tokens:
+            image_tokens = F.adaptive_avg_pool1d(
+                image_tokens.transpose(1, 2),
+                self.config.max_image_tokens,
+            ).transpose(1, 2)
+        image_tokens = image_tokens + self.image_modality
+
+        text_tokens, text_mask = self.encode_text(batch)
+        text_tokens = text_tokens + self.text_modality
+
+        state_token = self.state_encoder(self.prepare_state(batch)) + self.state_modality
+
+        obs_tokens = torch.cat([image_tokens, text_tokens, state_token], dim=1)
+        padding_mask = torch.cat(
+            [
+                torch.zeros(
+                    image_tokens.shape[:2],
+                    dtype=torch.bool,
+                    device=image_tokens.device,
+                ),
+                ~text_mask,
+                torch.zeros(state_token.shape[:2], dtype=torch.bool, device=state_token.device),
+            ],
+            dim=1,
+        )
+        encoded = self.observation_encoder(obs_tokens, src_key_padding_mask=padding_mask)
+        encoded = self.observation_norm(encoded)
+        return encoded.masked_fill(padding_mask[:, :, None], 0.0)
+
+    def encode_text(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         if OBS_LANGUAGE_TOKENS not in batch:
             raise KeyError(f"Missing {OBS_LANGUAGE_TOKENS}; use MiniVLAProcessor or provide tokenized text")
         lang_tokens = batch[OBS_LANGUAGE_TOKENS].long()
         lang_mask = batch.get(OBS_LANGUAGE_ATTENTION_MASK)
-        text_token = self.text_encoder(lang_tokens, lang_mask)
-
-        state = self.prepare_state(batch)
-        state_token = self.state_encoder(state)
-
-        fused = torch.cat([image_token.squeeze(1), text_token.squeeze(1), state_token.squeeze(1)], dim=-1)
-        return self.context_fusion(fused)[:, None, :]
+        return self.text_encoder(lang_tokens, lang_mask)
 
     def encode_images(self, batch: dict[str, Tensor]) -> Tensor:
         image_tensors = self.prepare_images(batch)
         encoded = []
-        for image in image_tensors:
-            encoded.append(self.vision_encoder(image))
+        for index, image in enumerate(image_tensors):
+            tokens = self.vision_encoder(image)
+            camera_index = min(index, self.camera_embedding.num_embeddings - 1)
+            tokens = tokens + self.camera_embedding.weight[camera_index][None, None, :]
+            encoded.append(tokens)
         return torch.cat(encoded, dim=1)
 
     def prepare_images(self, batch: dict[str, Tensor]) -> list[Tensor]:

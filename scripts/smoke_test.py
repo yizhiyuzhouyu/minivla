@@ -13,7 +13,7 @@ def main() -> None:
     torch.manual_seed(0)
     cfg = MiniVLAConfig(
         use_hf_vision_encoder=False,
-        image_keys=("observation.images.front",),
+        image_keys=("observation.images.front", "observation.images.wrist"),
         image_size=(64, 64),
         patch_size=16,
         hidden_dim=64,
@@ -31,6 +31,7 @@ def main() -> None:
 
     batch = {
         "observation.images.front": torch.rand(2, 3, 64, 64),
+        "observation.images.wrist": torch.rand(2, 3, 64, 64),
         OBS_LANGUAGE_TOKENS: torch.randint(0, cfg.text_vocab_size, (2, 12)),
         OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 12, dtype=torch.bool),
         OBS_STATE: torch.randn(2, 10),
@@ -44,8 +45,8 @@ def main() -> None:
     loss.backward()
     action_chunk = policy.predict_action_chunk({k: v for k, v in batch.items() if k != ACTION})
     single_action = policy.select_action({k: v for k, v in batch.items() if k != ACTION})
-    context = policy.encode_context({k: v for k, v in batch.items() if k != ACTION})
-    fm_actions = policy.fm_head.sample(context, num_steps=1)
+    obs_tokens = policy.encode_observation_tokens({k: v for k, v in batch.items() if k != ACTION})
+    fm_actions = policy.fm_head.sample(obs_tokens, num_steps=1)
 
     assert torch.isfinite(loss)
     assert torch.all(loss_none[0, -2:] == 0)

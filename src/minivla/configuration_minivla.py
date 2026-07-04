@@ -22,6 +22,7 @@ class MiniVLAConfig:
     use_hf_vision_encoder: bool = True
     freeze_vision_encoder: bool = True
     patch_size: int = 16
+    max_image_tokens: int | None = None
 
     text_vocab_size: int = 49152
     tokenizer_max_length: int = 48

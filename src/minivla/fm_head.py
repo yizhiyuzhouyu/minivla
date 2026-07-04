@@ -58,7 +58,7 @@ class DiTActionExpert(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.num_dit_layers)
         self.norm = nn.LayerNorm(config.hidden_dim)
 
-    def forward(self, context_token: Tensor, noisy_actions: Tensor, time: Tensor) -> Tensor:
+    def forward(self, obs_tokens: Tensor, noisy_actions: Tensor, time: Tensor) -> Tensor:
         time_emb = create_sinusoidal_pos_embedding(
             time,
             self.config.hidden_dim,
@@ -70,7 +70,7 @@ class DiTActionExpert(nn.Module):
 
         action_tokens = self.action_in_proj(noisy_actions)
         action_tokens = action_tokens + time_emb + self.action_pos_embed[:, : action_tokens.shape[1]]
-        tokens = torch.cat([context_token, action_tokens], dim=1)
+        tokens = torch.cat([obs_tokens, action_tokens], dim=1)
         tokens = self.norm(self.transformer(tokens))
         return self.action_out_proj(tokens[:, -self.config.chunk_size :])
 
@@ -101,12 +101,12 @@ class FMHead(nn.Module):
         )
         return time * self.config.time_sampling_scale + self.config.time_sampling_offset
 
-    def denoise_step(self, context: Tensor, x_t: Tensor, time: Tensor) -> Tensor:
-        return self.action_expert(context, x_t, time)
+    def denoise_step(self, obs_tokens: Tensor, x_t: Tensor, time: Tensor) -> Tensor:
+        return self.action_expert(obs_tokens, x_t, time)
 
     def loss(
         self,
-        context: Tensor,
+        obs_tokens: Tensor,
         actions: Tensor,
         action_dim: int,
         noise: Tensor | None = None,
@@ -117,7 +117,7 @@ class FMHead(nn.Module):
         if actions.shape[1] != self.config.chunk_size:
             raise ValueError(f"Expected action chunk length {self.config.chunk_size}, got {actions.shape[1]}")
 
-        actions = actions.to(dtype=context.dtype, device=context.device)
+        actions = actions.to(dtype=obs_tokens.dtype, device=obs_tokens.device)
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device, actions.dtype)
         noise = noise.to(device=actions.device, dtype=actions.dtype)
@@ -126,7 +126,7 @@ class FMHead(nn.Module):
 
         x_t = time[:, None, None].to(actions.dtype) * noise + (1.0 - time[:, None, None].to(actions.dtype)) * actions
         target_velocity = noise - actions
-        pred_velocity = self.denoise_step(context, x_t, time)
+        pred_velocity = self.denoise_step(obs_tokens, x_t, time)
 
         per_dim_loss = F.mse_loss(
             pred_velocity[..., :action_dim],
@@ -164,7 +164,7 @@ class FMHead(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        context: Tensor,
+        obs_tokens: Tensor,
         noise: Tensor | None = None,
         num_steps: int | None = None,
     ) -> Tensor:
@@ -173,9 +173,9 @@ class FMHead(nn.Module):
         if num_steps <= 0:
             raise ValueError("num_steps must be positive")
 
-        batch_size = context.shape[0]
-        device = context.device
-        dtype = context.dtype
+        batch_size = obs_tokens.shape[0]
+        device = obs_tokens.device
+        dtype = obs_tokens.dtype
         if noise is None:
             noise = self.sample_noise(
                 (batch_size, self.config.chunk_size, self.config.max_action_dim),
@@ -187,6 +187,6 @@ class FMHead(nn.Module):
 
         for step in range(num_steps):
             time = torch.full((batch_size,), 1.0 + step * dt, dtype=torch.float32, device=device)
-            velocity = self.denoise_step(context, x_t, time)
+            velocity = self.denoise_step(obs_tokens, x_t, time)
             x_t = x_t + dt * velocity
         return x_t

@@ -8,3 +8,8 @@ OBS_LANGUAGE_ATTENTION_MASK = f"{OBS_LANGUAGE}.attention_mask"
 
 ACTION = "action"
 ACTION_IS_PAD = "action_is_pad"
+EPISODE_SUCCESS = "episode.success"
+EPISODE_QUALITY = "episode.quality"
+SUBTASK_LABEL = "subtask.label"
+SUBGOAL_IMAGE = "subgoal.image"
+FUTURE_IMAGE = "future.image"
