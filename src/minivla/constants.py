@@ -1,0 +1,10 @@
+OBS_STR = "observation"
+OBS_STATE = f"{OBS_STR}.state"
+OBS_IMAGE = f"{OBS_STR}.image"
+OBS_IMAGES = f"{OBS_STR}.images"
+OBS_LANGUAGE = f"{OBS_STR}.language"
+OBS_LANGUAGE_TOKENS = f"{OBS_LANGUAGE}.tokens"
+OBS_LANGUAGE_ATTENTION_MASK = f"{OBS_LANGUAGE}.attention_mask"
+
+ACTION = "action"
+

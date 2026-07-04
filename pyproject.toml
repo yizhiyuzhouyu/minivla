@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minivla"
+version = "0.1.0"
+description = "A compact LeRobot-compatible VLA policy with CLIP/ViT vision, pooled text, proprioception, and DiT flow-matching action expert."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.40",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
