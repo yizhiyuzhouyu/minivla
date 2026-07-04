@@ -8,7 +8,15 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from minivla.configuration_minivla import MiniVLAConfig
-from minivla.constants import ACTION, OBS_IMAGE, OBS_IMAGES, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from minivla.constants import (
+    ACTION,
+    ACTION_IS_PAD,
+    OBS_IMAGE,
+    OBS_IMAGES,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
 from minivla.fm_head import FMHead
 
 
@@ -20,6 +28,13 @@ def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
     if vector.shape[-1] >= new_dim:
         return vector[..., :new_dim]
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
+
+
+def get_action_pad_mask(batch: dict[str, Tensor]) -> Tensor | None:
+    for key in (ACTION_IS_PAD, "action_pad_mask", "actions_id_pad"):
+        if key in batch:
+            return batch[key]
+    return None
 
 
 class PatchVisionEncoder(nn.Module):
@@ -175,7 +190,7 @@ class MiniVLAPolicy(nn.Module):
             action_dim=action_dim,
             noise=noise,
             time=time,
-            action_pad_mask=batch.get("actions_id_pad"),
+            action_pad_mask=get_action_pad_mask(batch),
             reduction=reduction,
         )
 

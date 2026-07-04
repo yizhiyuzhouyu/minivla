@@ -134,6 +134,13 @@ class FMHead(nn.Module):
             reduction="none",
         )
         if action_pad_mask is not None:
+            if action_pad_mask.ndim == 1:
+                action_pad_mask = action_pad_mask[:, None].expand(-1, actions.shape[1])
+            if action_pad_mask.shape != actions.shape[:2]:
+                raise ValueError(
+                    "action_pad_mask must have shape "
+                    f"{tuple(actions.shape[:2])}, got {tuple(action_pad_mask.shape)}"
+                )
             valid = (~action_pad_mask.bool()).to(dtype=per_dim_loss.dtype, device=per_dim_loss.device)
             per_dim_loss = per_dim_loss * valid[:, :, None]
             denom = valid.sum().clamp_min(1.0) * action_dim
@@ -183,4 +190,3 @@ class FMHead(nn.Module):
             velocity = self.denoise_step(context, x_t, time)
             x_t = x_t + dt * velocity
         return x_t
-

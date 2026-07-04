@@ -17,6 +17,27 @@
 /home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/smoke_test.py
 ```
 
+## Training
+
+`scripts/train.py` 提供了一个 LeRobot 数据集训练入口，包含 dataset stats normalizer、checkpoint save/load 和基础命令行配置：
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train.py \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --output-dir outputs/minivla \
+  --batch-size 8 \
+  --max-steps 10000
+```
+
+恢复训练：
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train.py \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --resume outputs/minivla/last.pt \
+  --use-checkpoint-config
+```
+
 ## Minimal Usage
 
 ```python
@@ -44,6 +65,18 @@ batch = {
 
 loss, info = policy(batch)
 actions = policy.predict_action_chunk({k: v for k, v in batch.items() if k != ACTION})
+```
+
+动作由 `FMHead` 生成：训练时采样噪声 `noise` 和时间 `t`，构造
+`x_t = t * noise + (1 - t) * action`，让 DiT action expert 预测 velocity
+`noise - action`；推理时从高斯噪声开始，用 Euler denoise 积分得到完整 action chunk。
+
+loss 是 masked MSE，只计算有效 action step。batch 里可以传 LeRobot 风格的
+`action_is_pad`，其中 `True` 表示该 step 是 padding，不参与 loss：
+
+```python
+batch["action_is_pad"] = torch.zeros(2, cfg.chunk_size, dtype=torch.bool)
+batch["action_is_pad"][0, -2:] = True
 ```
 
 `policy.fm_head` 可以单独使用：输入已经融合好的 context token，输出完整 padded action chunk：

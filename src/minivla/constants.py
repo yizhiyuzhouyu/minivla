@@ -7,4 +7,4 @@ OBS_LANGUAGE_TOKENS = f"{OBS_LANGUAGE}.tokens"
 OBS_LANGUAGE_ATTENTION_MASK = f"{OBS_LANGUAGE}.attention_mask"
 
 ACTION = "action"
-
+ACTION_IS_PAD = "action_is_pad"
