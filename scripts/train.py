@@ -99,6 +99,8 @@ def config_from_args(args: argparse.Namespace, checkpoint: dict[str, Any] | None
         "max_state_dim": args.max_state_dim,
         "max_action_dim": args.max_action_dim,
         "action_dim": args.action_dim,
+        "use_episode_metadata": args.use_episode_metadata,
+        "future_latent_loss_weight": args.future_latent_loss_weight,
         "text_vocab_size": args.text_vocab_size,
         "tokenizer_max_length": args.tokenizer_max_length,
         "num_inference_steps": args.num_inference_steps,
@@ -128,6 +130,7 @@ def save_checkpoint(
             "step": step,
             "epoch": epoch,
             "config": asdict(config),
+            "norm_stats": stats,
             "dataset_stats": stats,
             "assets": assets,
         },
@@ -183,6 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-state-dim", type=int, default=32)
     parser.add_argument("--max-action-dim", type=int, default=32)
     parser.add_argument("--action-dim", type=int, default=None)
+    parser.add_argument("--use-episode-metadata", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--future-latent-loss-weight", type=float, default=0.0)
     parser.add_argument("--text-vocab-size", type=int, default=49152)
     parser.add_argument("--tokenizer-max-length", type=int, default=48)
     parser.add_argument("--num-inference-steps", type=int, default=10)
@@ -217,9 +222,12 @@ def main() -> None:
     start_epoch = 0
 
     if checkpoint is not None:
-        policy.load_state_dict(checkpoint["model"])
+        policy.load_compatible_state_dict(checkpoint["model"])
         if "optimizer" in checkpoint:
-            optimizer.load_state_dict(checkpoint["optimizer"])
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            except ValueError as exc:
+                print(f"warning: skipped incompatible optimizer state: {exc}", flush=True)
         start_step = int(checkpoint.get("step", 0))
         start_epoch = int(checkpoint.get("epoch", 0))
 
@@ -243,10 +251,14 @@ def main() -> None:
             SUBGOAL_IMAGE,
             FUTURE_IMAGE,
         ],
+        "normalizer": {
+            "normalize_state": args.normalize_state,
+            "normalize_action": args.normalize_action,
+            "stats_key": "norm_stats",
+        },
         "normalize_state": args.normalize_state,
         "normalize_action": args.normalize_action,
-        "processor": "MiniVLAProcessor",
-        "tokenizer_name": config.tokenizer_name,
+        "processor": processor.metadata(),
     }
     max_steps = args.max_steps if args.max_steps is not None else math.inf
     step = start_step

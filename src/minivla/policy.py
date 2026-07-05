@@ -47,14 +47,16 @@ class MiniVLAPolicyRunner:
         config = load_config(checkpoint.get("config"))
         config.device = str(device)
         policy = MiniVLAPolicy(config).to(device)
-        policy.load_state_dict(checkpoint["model"])
+        policy.load_compatible_state_dict(checkpoint["model"])
         processor = MiniVLAProcessor(config)
         assets = checkpoint.get("assets") or {}
+        norm_stats = checkpoint.get("norm_stats", checkpoint.get("dataset_stats"))
+        normalizer_assets = assets.get("normalizer", {}) if isinstance(assets.get("normalizer"), dict) else {}
         normalizer = BatchNormalizer(
-            checkpoint.get("dataset_stats"),
+            norm_stats,
             device=device,
-            normalize_state=bool(assets.get("normalize_state", True)),
-            normalize_action=bool(assets.get("normalize_action", True)),
+            normalize_state=bool(normalizer_assets.get("normalize_state", assets.get("normalize_state", True))),
+            normalize_action=bool(normalizer_assets.get("normalize_action", assets.get("normalize_action", True))),
         )
         return cls(policy, processor, normalizer, device=device, assets=assets)
 

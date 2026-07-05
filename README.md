@@ -2,12 +2,12 @@
 
 `minivla` 是一个独立的小型 VLA policy 包，接口尽量贴近 LeRobot batch 约定：
 
-- image token: CLIP/ViT vision encoder + linear projector
-- text token: token embedding + attention-mask mean pooling + linear
+- image token: 多视角 CLIP/ViT patch tokens + linear projector + camera embedding
+- text token: token embedding + attention mask，保留 token-level language memory
 - state token: proprioception/state linear projection，使用 `observation.state`
-- fusion: pooled image/text/state token concat 后接 MLP
+- fusion: image/text/state/可选 metadata tokens concat 后接 observation Transformer
 - FMHead: 参考 openpi/pi0 的 flow matching 训练和 Euler denoise 推理
-- action expert: FMHead 内部使用轻量 DiT 预测 action velocity
+- action expert: FMHead 内部使用轻量 DiT，以完整 observation memory conditioning 预测 action velocity
 
 默认配置里保留了 `vlm_base_model_name="lerobot/smolvla_base"`，实际视觉编码器默认使用 `openai/clip-vit-base-patch32`。如果本机不能联网下载 HF 权重，可以把 `use_hf_vision_encoder=False`，会使用内置 patch-ViT fallback。
 
@@ -38,7 +38,7 @@
   --use-checkpoint-config
 ```
 
-训练 checkpoint 会保存 `config`、`dataset_stats` 和 tokenizer/normalizer metadata。推理时可以用同一套 transform 路径恢复：
+训练 checkpoint 会保存 `config`、`norm_stats`、兼容旧字段的 `dataset_stats`，以及 processor/tokenizer/normalizer metadata。推理时可以用同一套 transform 路径恢复：
 
 ```python
 from minivla import MiniVLAPolicyRunner
@@ -103,6 +103,12 @@ obs_tokens = policy.encode_observation_tokens({k: v for k, v in batch.items() if
 padded_actions = policy.fm_head.sample(obs_tokens)
 ```
 
+可选 metadata / auxiliary 输入：
+
+- `episode.success`、`episode.quality` 会被编码成一个 episode metadata token。
+- `subtask.label` 会被 processor tokenized 成 `subtask.tokens`，并作为额外 language memory。
+- 设置 `future_latent_loss_weight > 0` 且 batch 提供 `future.image` 时，会启用轻量 future latent auxiliary loss。
+
 ## Notes
 
-训练数据预处理可以直接沿用 LeRobot 的命名方式：图像键用 `observation.images.*`，关节/末端状态放 `observation.state`，动作放 `action`，语言 tokens 放 `observation.language.tokens`，mask 放 `observation.language.attention_mask`。
+训练数据预处理可以直接沿用 LeRobot 的命名方式：图像键用 `observation.images.*`，关节/末端状态放 `observation.state`，动作放 `action`，语言 tokens 放 `observation.language.tokens`，mask 放 `observation.language.attention_mask`。`transforms.py` 负责 repack、resize、pad、normalize / unnormalize 和 tokenize 调度。

@@ -35,6 +35,8 @@ class MiniVLAConfig:
     max_state_dim: int = 32
     max_action_dim: int = 32
     action_dim: int | None = None
+    use_episode_metadata: bool = False
+    future_latent_loss_weight: float = 0.0
 
     hidden_dim: int = 512
     num_dit_layers: int = 6
@@ -66,6 +68,8 @@ class MiniVLAConfig:
             self.action_dim = self.max_action_dim
         if self.action_dim <= 0 or self.action_dim > self.max_action_dim:
             raise ValueError("action_dim must be in (0, max_action_dim]")
+        if self.future_latent_loss_weight < 0:
+            raise ValueError("future_latent_loss_weight must be non-negative")
         if self.hidden_dim % self.num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
         if self.image_size[0] % self.patch_size != 0 or self.image_size[1] % self.patch_size != 0:

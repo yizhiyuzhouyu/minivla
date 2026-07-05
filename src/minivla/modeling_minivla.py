@@ -10,12 +10,18 @@ from torch import Tensor, nn
 from minivla.configuration_minivla import MiniVLAConfig
 from minivla.constants import (
     ACTION,
+    ACTION_DIM,
     ACTION_IS_PAD,
+    EPISODE_QUALITY,
+    EPISODE_SUCCESS,
+    FUTURE_IMAGE,
     OBS_IMAGE,
     OBS_IMAGES,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
     OBS_STATE,
+    SUBTASK_ATTENTION_MASK,
+    SUBTASK_TOKENS,
 )
 from minivla.fm_head import FMHead
 
@@ -150,6 +156,14 @@ class MiniVLAPolicy(nn.Module):
         self.image_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
         self.text_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
         self.state_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        self.metadata_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        self.subtask_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
+        self.metadata_encoder = nn.Sequential(
+            nn.Linear(2, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+        )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.hidden_dim,
             nhead=config.num_heads,
@@ -166,6 +180,12 @@ class MiniVLAPolicy(nn.Module):
         self.observation_norm = nn.LayerNorm(config.hidden_dim)
         self.fm_head = FMHead(config)
         self.action_expert = self.fm_head.action_expert
+        self.future_latent_predictor = nn.Sequential(
+            nn.LayerNorm(config.hidden_dim),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+        )
         self._queues: dict[str, deque[Tensor]] = {}
         self.reset()
         self.to(dtype=_torch_dtype(config.dtype))
@@ -177,6 +197,25 @@ class MiniVLAPolicy(nn.Module):
 
     def get_optim_params(self) -> Iterable[nn.Parameter]:
         return self.parameters()
+
+    def load_compatible_state_dict(self, state_dict: dict[str, Tensor]) -> None:
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        allowed_missing_prefixes = (
+            "metadata_modality",
+            "subtask_modality",
+            "metadata_encoder.",
+            "future_latent_predictor.",
+        )
+        bad_missing = [
+            key for key in missing if not any(key.startswith(prefix) for prefix in allowed_missing_prefixes)
+        ]
+        if bad_missing or unexpected:
+            details = []
+            if bad_missing:
+                details.append(f"missing={bad_missing}")
+            if unexpected:
+                details.append(f"unexpected={unexpected}")
+            raise RuntimeError("Checkpoint is not compatible with MiniVLAPolicy: " + ", ".join(details))
 
     def sample_noise(self, shape: torch.Size | tuple[int, ...], device: torch.device) -> Tensor:
         return self.fm_head.sample_noise(shape, device, next(self.parameters()).dtype)
@@ -192,10 +231,15 @@ class MiniVLAPolicy(nn.Module):
         reduction: str = "mean",
     ) -> tuple[Tensor, dict[str, Tensor | float]]:
         actions_raw = batch[ACTION]
-        action_dim = min(actions_raw.shape[-1], self.config.max_action_dim)
+        action_dim = batch.get(ACTION_DIM, self.config.action_dim)
+        if torch.is_tensor(action_dim):
+            if action_dim.numel() > 1 and not torch.all(action_dim == action_dim.flatten()[0]):
+                raise ValueError("MiniVLA does not support mixed action_dim values within one batch")
+            action_dim = int(action_dim.flatten()[0].item())
+        action_dim = min(int(action_dim), self.config.max_action_dim)
         actions = pad_vector(actions_raw, self.config.max_action_dim).to(dtype=next(self.parameters()).dtype)
         obs_tokens = self.encode_observation_tokens(batch)
-        return self.fm_head.loss(
+        loss, info = self.fm_head.loss(
             obs_tokens=obs_tokens,
             actions=actions,
             action_dim=action_dim,
@@ -204,6 +248,12 @@ class MiniVLAPolicy(nn.Module):
             action_pad_mask=get_action_pad_mask(batch),
             reduction=reduction,
         )
+        future_loss = self.future_latent_loss(batch, obs_tokens)
+        if future_loss is not None and reduction == "mean":
+            loss = loss + self.config.future_latent_loss_weight * future_loss
+            info["future_latent_loss"] = future_loss.detach()
+            info["loss"] = loss.detach()
+        return loss, info
 
     @torch.no_grad()
     def predict_action_chunk(
@@ -249,8 +299,9 @@ class MiniVLAPolicy(nn.Module):
         text_tokens = text_tokens + self.text_modality
 
         state_token = self.state_encoder(self.prepare_state(batch)) + self.state_modality
+        optional_tokens, optional_mask = self.encode_optional_tokens(batch, state_token.shape[0], state_token.device)
 
-        obs_tokens = torch.cat([image_tokens, text_tokens, state_token], dim=1)
+        obs_tokens = torch.cat([image_tokens, text_tokens, state_token, optional_tokens], dim=1)
         padding_mask = torch.cat(
             [
                 torch.zeros(
@@ -260,6 +311,7 @@ class MiniVLAPolicy(nn.Module):
                 ),
                 ~text_mask,
                 torch.zeros(state_token.shape[:2], dtype=torch.bool, device=state_token.device),
+                optional_mask,
             ],
             dim=1,
         )
@@ -274,18 +326,73 @@ class MiniVLAPolicy(nn.Module):
         lang_mask = batch.get(OBS_LANGUAGE_ATTENTION_MASK)
         return self.text_encoder(lang_tokens, lang_mask)
 
-    def encode_images(self, batch: dict[str, Tensor]) -> Tensor:
-        image_tensors = self.prepare_images(batch)
+    def encode_optional_tokens(
+        self,
+        batch: dict[str, Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor]:
+        tokens = []
+        masks = []
+        dtype = next(self.parameters()).dtype
+
+        if self.config.use_episode_metadata and (EPISODE_SUCCESS in batch or EPISODE_QUALITY in batch):
+            values = torch.zeros(batch_size, 2, dtype=dtype, device=device)
+            if EPISODE_SUCCESS in batch:
+                success = batch[EPISODE_SUCCESS]
+                if not torch.is_tensor(success):
+                    success = torch.as_tensor(success, device=device)
+                values[:, 0] = success.to(device=device, dtype=dtype).flatten()[:batch_size]
+            if EPISODE_QUALITY in batch:
+                quality = batch[EPISODE_QUALITY]
+                if not torch.is_tensor(quality):
+                    quality = torch.as_tensor(quality, device=device)
+                values[:, 1] = quality.to(device=device, dtype=dtype).flatten()[:batch_size]
+            tokens.append(self.metadata_encoder(values)[:, None, :] + self.metadata_modality)
+            masks.append(torch.zeros(batch_size, 1, dtype=torch.bool, device=device))
+
+        if SUBTASK_TOKENS in batch:
+            subtask_tokens = batch[SUBTASK_TOKENS].long()
+            subtask_mask = batch.get(SUBTASK_ATTENTION_MASK)
+            encoded, subtask_mask = self.text_encoder(subtask_tokens, subtask_mask)
+            tokens.append(encoded + self.subtask_modality)
+            masks.append(~subtask_mask)
+
+        if not tokens:
+            return (
+                torch.zeros(batch_size, 0, self.config.hidden_dim, dtype=dtype, device=device),
+                torch.zeros(batch_size, 0, dtype=torch.bool, device=device),
+            )
+        return torch.cat(tokens, dim=1), torch.cat(masks, dim=1)
+
+    def future_latent_loss(self, batch: dict[str, Tensor], obs_tokens: Tensor) -> Tensor | None:
+        if self.config.future_latent_loss_weight <= 0 or FUTURE_IMAGE not in batch:
+            return None
+        pred = self.future_latent_predictor(obs_tokens.mean(dim=1))
+        with torch.no_grad():
+            future_tokens = self.encode_images(batch, keys=(FUTURE_IMAGE,), add_camera=False)
+            target = future_tokens.mean(dim=1)
+        return F.mse_loss(pred, target)
+
+    def encode_images(
+        self,
+        batch: dict[str, Tensor],
+        keys: tuple[str, ...] | None = None,
+        add_camera: bool = True,
+    ) -> Tensor:
+        image_tensors = self.prepare_images(batch, keys=keys)
         encoded = []
         for index, image in enumerate(image_tensors):
             tokens = self.vision_encoder(image)
-            camera_index = min(index, self.camera_embedding.num_embeddings - 1)
-            tokens = tokens + self.camera_embedding.weight[camera_index][None, None, :]
+            if add_camera:
+                camera_index = min(index, self.camera_embedding.num_embeddings - 1)
+                tokens = tokens + self.camera_embedding.weight[camera_index][None, None, :]
             encoded.append(tokens)
         return torch.cat(encoded, dim=1)
 
-    def prepare_images(self, batch: dict[str, Tensor]) -> list[Tensor]:
-        keys = [key for key in self.config.image_keys if key in batch]
+    def prepare_images(self, batch: dict[str, Tensor], keys: tuple[str, ...] | None = None) -> list[Tensor]:
+        if keys is None:
+            keys = tuple(key for key in self.config.image_keys if key in batch)
         if not keys:
             keys = [key for key in batch if key == OBS_IMAGE or key.startswith(f"{OBS_IMAGES}.")]
         if not keys:

@@ -8,7 +8,17 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from minivla.configuration_minivla import MiniVLAConfig
-from minivla.constants import ACTION, OBS_IMAGE, OBS_IMAGES, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from minivla.constants import (
+    ACTION,
+    ACTION_DIM,
+    FUTURE_IMAGE,
+    OBS_IMAGE,
+    OBS_IMAGES,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+    SUBGOAL_IMAGE,
+)
 from minivla.processor import MiniVLAProcessor
 
 
@@ -36,12 +46,20 @@ def repack_batch(batch: Mapping[str, Any], key_map: Mapping[str, str] | None = N
     return out
 
 
+def tokenize_batch(
+    batch: Mapping[str, Any],
+    processor: MiniVLAProcessor,
+    device: torch.device | str | None = None,
+) -> dict[str, Any]:
+    return processor(dict(batch), device=device)
+
+
 def convert_images(batch: Mapping[str, Any], image_size: tuple[int, int] | None = None) -> dict[str, Any]:
     out = dict(batch)
     for key, value in list(out.items()):
         if not torch.is_tensor(value):
             continue
-        if key != OBS_IMAGE and not key.startswith(f"{OBS_IMAGES}."):
+        if key not in {OBS_IMAGE, SUBGOAL_IMAGE, FUTURE_IMAGE} and not key.startswith(f"{OBS_IMAGES}."):
             continue
         image = value
         if image.dtype == torch.uint8:
@@ -158,7 +176,9 @@ def prepare_batch(
     out = convert_images(out, config.image_size)
     if normalizer is not None:
         out = normalizer(out)
-    out = processor(out, device=device)
+    if ACTION in out and torch.is_tensor(out[ACTION]) and ACTION_DIM not in out:
+        out[ACTION_DIM] = min(out[ACTION].shape[-1], config.max_action_dim)
+    out = tokenize_batch(out, processor, device=device)
 
     if ACTION in out and torch.is_tensor(out[ACTION]) and out[ACTION].ndim == 2:
         out[ACTION] = out[ACTION].unsqueeze(1)
