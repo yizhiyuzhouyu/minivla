@@ -40,8 +40,14 @@ class PolicyHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length))
         num_steps = payload.pop("num_steps", None)
-        result = self.runner.infer(_json_to_batch(payload), num_steps=num_steps)
-        body = json.dumps({"actions": _tensor_to_json(result["actions"])}).encode("utf-8")
+        select_action = bool(payload.pop("select_action", False))
+        if select_action:
+            result = self.runner.select_action(_json_to_batch(payload))
+            response = {"action": _tensor_to_json(result["action"])}
+        else:
+            result = self.runner.infer(_json_to_batch(payload), num_steps=num_steps)
+            response = {"actions": _tensor_to_json(result["actions"])}
+        body = json.dumps(response).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

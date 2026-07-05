@@ -91,14 +91,20 @@ def config_from_args(args: argparse.Namespace, checkpoint: dict[str, Any] | None
         "image_keys": tuple(args.image_keys),
         "image_size": tuple(args.image_size),
         "patch_size": args.patch_size,
+        "image_token_reduction": args.image_token_reduction,
+        "visual_resampler_layers": args.visual_resampler_layers,
         "hidden_dim": args.hidden_dim,
         "num_heads": args.num_heads,
         "num_dit_layers": args.num_dit_layers,
+        "action_head": args.action_head,
         "chunk_size": args.chunk_size,
         "n_action_steps": args.n_action_steps,
         "max_state_dim": args.max_state_dim,
         "max_action_dim": args.max_action_dim,
         "action_dim": args.action_dim,
+        "use_temporal_ensemble": args.use_temporal_ensemble,
+        "temporal_ensemble_max_chunks": args.temporal_ensemble_max_chunks,
+        "temporal_ensemble_decay": args.temporal_ensemble_decay,
         "use_episode_metadata": args.use_episode_metadata,
         "future_latent_loss_weight": args.future_latent_loss_weight,
         "text_vocab_size": args.text_vocab_size,
@@ -144,9 +150,35 @@ def load_checkpoint(path: str | None, map_location: str | torch.device) -> dict[
     return torch.load(path, map_location=map_location)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def load_yaml_defaults(path: str | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ImportError("PyYAML is required for --config. Install project dependencies first.") from exc
+
+    with Path(path).open("r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must contain a mapping, got {type(data).__name__}")
+    return {str(key).replace("-", "_"): value for key, value in data.items()}
+
+
+def apply_parser_defaults(parser: argparse.ArgumentParser, defaults: dict[str, Any]) -> None:
+    if not defaults:
+        return
+    valid_dests = {action.dest for action in parser._actions}
+    unknown = sorted(key for key in defaults if key not in valid_dests)
+    if unknown:
+        raise ValueError(f"Unknown config keys in YAML: {unknown}")
+    parser.set_defaults(**defaults)
+
+
+def build_parser(config_defaults: dict[str, Any] | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train MiniVLA on a LeRobot dataset.")
-    parser.add_argument("--dataset-repo-id", required=True, help="LeRobot dataset repo id or local dataset id.")
+    parser.add_argument("--config", default=None, help="Optional YAML config. CLI flags override config values.")
+    parser.add_argument("--dataset-repo-id", default=None, help="LeRobot dataset repo id or local dataset id.")
     parser.add_argument("--dataset-root", default=None, help="Optional local dataset root.")
     parser.add_argument("--episodes", type=int, nargs="*", default=None, help="Optional episode ids to train on.")
     parser.add_argument("--output-dir", default="outputs/minivla", help="Directory for checkpoints.")
@@ -178,25 +210,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-keys", nargs="+", default=["observation.images.front"])
     parser.add_argument("--image-size", type=int, nargs=2, default=[224, 224])
     parser.add_argument("--patch-size", type=int, default=16)
+    parser.add_argument("--image-token-reduction", default="adaptive_pool", choices=["adaptive_pool", "resampler"])
+    parser.add_argument("--visual-resampler-layers", type=int, default=1)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-dit-layers", type=int, default=4)
+    parser.add_argument("--action-head", default="flow_matching", choices=["flow_matching", "mlp", "query"])
     parser.add_argument("--chunk-size", type=int, default=50)
     parser.add_argument("--n-action-steps", type=int, default=50)
     parser.add_argument("--max-state-dim", type=int, default=32)
     parser.add_argument("--max-action-dim", type=int, default=32)
     parser.add_argument("--action-dim", type=int, default=None)
+    parser.add_argument("--use-temporal-ensemble", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--temporal-ensemble-max-chunks", type=int, default=8)
+    parser.add_argument("--temporal-ensemble-decay", type=float, default=0.5)
     parser.add_argument("--use-episode-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--future-latent-loss-weight", type=float, default=0.0)
     parser.add_argument("--text-vocab-size", type=int, default=49152)
     parser.add_argument("--tokenizer-max-length", type=int, default=48)
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--max-image-tokens", type=int, default=None)
+    apply_parser_defaults(parser, config_defaults or {})
     return parser
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    config_probe = argparse.ArgumentParser(add_help=False)
+    config_probe.add_argument("--config", default=None)
+    config_args, _ = config_probe.parse_known_args()
+    config_defaults = load_yaml_defaults(config_args.config)
+    parser = build_parser(config_defaults)
+    args = parser.parse_args()
+    if args.dataset_repo_id is None:
+        parser.error("--dataset-repo-id is required unless it is set in --config")
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 

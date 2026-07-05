@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from minivla.action_heads import MLPActionHead, QueryActionHead
 from minivla.configuration_minivla import MiniVLAConfig
 from minivla.constants import (
     ACTION,
@@ -108,6 +109,54 @@ class HFVisionEncoder(nn.Module):
         return self.projector(tokens)
 
 
+class VisualTokenResampler(nn.Module):
+    """Learned query resampler for compressing dense visual patch tokens."""
+
+    def __init__(self, config: MiniVLAConfig):
+        super().__init__()
+        if config.max_image_tokens is None:
+            raise ValueError("VisualTokenResampler requires max_image_tokens")
+        self.query = nn.Parameter(torch.zeros(1, config.max_image_tokens, config.hidden_dim))
+        self.layers = nn.ModuleList(
+            [
+                nn.ModuleDict(
+                    {
+                        "query_norm": nn.LayerNorm(config.hidden_dim),
+                        "context_norm": nn.LayerNorm(config.hidden_dim),
+                        "attn": nn.MultiheadAttention(
+                            config.hidden_dim,
+                            config.num_heads,
+                            dropout=config.dropout,
+                            batch_first=True,
+                        ),
+                        "ffn_norm": nn.LayerNorm(config.hidden_dim),
+                        "ffn": nn.Sequential(
+                            nn.Linear(config.hidden_dim, int(config.hidden_dim * config.mlp_ratio)),
+                            nn.GELU(),
+                            nn.Linear(int(config.hidden_dim * config.mlp_ratio), config.hidden_dim),
+                        ),
+                    }
+                )
+                for _ in range(config.visual_resampler_layers)
+            ]
+        )
+        self.out_norm = nn.LayerNorm(config.hidden_dim)
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        queries = self.query.expand(tokens.shape[0], -1, -1).to(dtype=tokens.dtype, device=tokens.device)
+        context = tokens
+        for layer in self.layers:
+            attn_out, _ = layer["attn"](
+                layer["query_norm"](queries),
+                layer["context_norm"](context),
+                layer["context_norm"](context),
+                need_weights=False,
+            )
+            queries = queries + attn_out
+            queries = queries + layer["ffn"](layer["ffn_norm"](queries))
+        return self.out_norm(queries)
+
+
 class TextTokenEncoder(nn.Module):
     """Embedding + projection text encoder that preserves token-level language."""
 
@@ -150,6 +199,11 @@ class MiniVLAPolicy(nn.Module):
         super().__init__()
         self.config = config
         self.vision_encoder = HFVisionEncoder(config) if config.use_hf_vision_encoder else PatchVisionEncoder(config)
+        self.visual_resampler = (
+            VisualTokenResampler(config)
+            if config.max_image_tokens is not None and config.image_token_reduction == "resampler"
+            else None
+        )
         self.text_encoder = TextTokenEncoder(config)
         self.state_encoder = StateEncoder(config)
         self.camera_embedding = nn.Embedding(max(1, len(config.image_keys)), config.hidden_dim)
@@ -178,8 +232,20 @@ class MiniVLAPolicy(nn.Module):
             num_layers=max(1, config.num_dit_layers // 2),
         )
         self.observation_norm = nn.LayerNorm(config.hidden_dim)
-        self.fm_head = FMHead(config)
-        self.action_expert = self.fm_head.action_expert
+        if config.action_head == "flow_matching":
+            self.fm_head = FMHead(config)
+            self.direct_action_head = None
+            self.action_expert = self.fm_head.action_expert
+        elif config.action_head == "mlp":
+            self.fm_head = None
+            self.direct_action_head = MLPActionHead(config)
+            self.action_expert = self.direct_action_head
+        elif config.action_head == "query":
+            self.fm_head = None
+            self.direct_action_head = QueryActionHead(config)
+            self.action_expert = self.direct_action_head
+        else:
+            raise ValueError(f"Unsupported action_head: {config.action_head}")
         self.future_latent_predictor = nn.Sequential(
             nn.LayerNorm(config.hidden_dim),
             nn.Linear(config.hidden_dim, config.hidden_dim),
@@ -187,6 +253,7 @@ class MiniVLAPolicy(nn.Module):
             nn.Linear(config.hidden_dim, config.hidden_dim),
         )
         self._queues: dict[str, deque[Tensor]] = {}
+        self._ensemble_chunks: deque[tuple[Tensor, int]] = deque(maxlen=config.temporal_ensemble_max_chunks)
         self.reset()
         self.to(dtype=_torch_dtype(config.dtype))
         if config.device is not None:
@@ -194,6 +261,7 @@ class MiniVLAPolicy(nn.Module):
 
     def reset(self) -> None:
         self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
+        self._ensemble_chunks = deque(maxlen=self.config.temporal_ensemble_max_chunks)
 
     def get_optim_params(self) -> Iterable[nn.Parameter]:
         return self.parameters()
@@ -201,6 +269,8 @@ class MiniVLAPolicy(nn.Module):
     def load_compatible_state_dict(self, state_dict: dict[str, Tensor]) -> None:
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
         allowed_missing_prefixes = (
+            "visual_resampler.",
+            "direct_action_head.",
             "metadata_modality",
             "subtask_modality",
             "metadata_encoder.",
@@ -217,11 +287,24 @@ class MiniVLAPolicy(nn.Module):
                 details.append(f"unexpected={unexpected}")
             raise RuntimeError("Checkpoint is not compatible with MiniVLAPolicy: " + ", ".join(details))
 
+    def get_action_head(self) -> nn.Module:
+        if self.config.action_head == "flow_matching":
+            if self.fm_head is None:
+                raise RuntimeError("MiniVLAConfig selects flow_matching but fm_head is not initialized")
+            return self.fm_head
+        if self.direct_action_head is None:
+            raise RuntimeError(f"MiniVLAConfig selects {self.config.action_head} but direct_action_head is not initialized")
+        return self.direct_action_head
+
     def sample_noise(self, shape: torch.Size | tuple[int, ...], device: torch.device) -> Tensor:
-        return self.fm_head.sample_noise(shape, device, next(self.parameters()).dtype)
+        if self.fm_head is not None:
+            return self.fm_head.sample_noise(shape, device, next(self.parameters()).dtype)
+        return torch.randn(shape, dtype=next(self.parameters()).dtype, device=device)
 
     def sample_time(self, batch_size: int, device: torch.device) -> Tensor:
-        return self.fm_head.sample_time(batch_size, device)
+        if self.fm_head is not None:
+            return self.fm_head.sample_time(batch_size, device)
+        return torch.zeros(batch_size, dtype=torch.float32, device=device)
 
     def forward(
         self,
@@ -239,7 +322,7 @@ class MiniVLAPolicy(nn.Module):
         action_dim = min(int(action_dim), self.config.max_action_dim)
         actions = pad_vector(actions_raw, self.config.max_action_dim).to(dtype=next(self.parameters()).dtype)
         obs_tokens = self.encode_observation_tokens(batch)
-        loss, info = self.fm_head.loss(
+        loss, info = self.get_action_head().loss(
             obs_tokens=obs_tokens,
             actions=actions,
             action_dim=action_dim,
@@ -266,10 +349,35 @@ class MiniVLAPolicy(nn.Module):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        if self.config.use_temporal_ensemble:
+            return self.select_action_temporal_ensemble(batch, noise=noise)
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch, noise=noise)
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
         return self._queues[ACTION].popleft()
+
+    @torch.no_grad()
+    def select_action_temporal_ensemble(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+        new_chunk = self.predict_action_chunk(batch, noise=noise)
+        self._ensemble_chunks.append((new_chunk, 0))
+
+        candidates = []
+        weights = []
+        for chunk, age in self._ensemble_chunks:
+            if age < chunk.shape[1]:
+                candidates.append(chunk[:, age])
+                weights.append(torch.exp(torch.tensor(-self.config.temporal_ensemble_decay * age, device=chunk.device)))
+        if not candidates:
+            raise RuntimeError("Temporal ensemble has no valid action candidates")
+
+        stacked = torch.stack(candidates, dim=0)
+        weight_tensor = torch.stack(weights).to(dtype=stacked.dtype)
+        action = (stacked * weight_tensor[:, None, None]).sum(dim=0) / weight_tensor.sum().clamp_min(1e-6)
+        self._ensemble_chunks = deque(
+            [(chunk, age + 1) for chunk, age in self._ensemble_chunks if age + 1 < chunk.shape[1]],
+            maxlen=self.config.temporal_ensemble_max_chunks,
+        )
+        return action
 
     @torch.no_grad()
     def sample_actions(
@@ -280,7 +388,7 @@ class MiniVLAPolicy(nn.Module):
     ) -> Tensor:
         self.eval()
         obs_tokens = self.encode_observation_tokens(batch)
-        actions = self.fm_head.sample(obs_tokens=obs_tokens, noise=noise, num_steps=num_steps)
+        actions = self.get_action_head().sample(obs_tokens=obs_tokens, noise=noise, num_steps=num_steps)
         return actions[..., : self.config.action_dim]
 
     def encode_context(self, batch: dict[str, Tensor]) -> Tensor:
@@ -288,7 +396,9 @@ class MiniVLAPolicy(nn.Module):
 
     def encode_observation_tokens(self, batch: dict[str, Tensor]) -> Tensor:
         image_tokens = self.encode_images(batch)
-        if self.config.max_image_tokens is not None and image_tokens.shape[1] > self.config.max_image_tokens:
+        if self.visual_resampler is not None:
+            image_tokens = self.visual_resampler(image_tokens)
+        elif self.config.max_image_tokens is not None and image_tokens.shape[1] > self.config.max_image_tokens:
             image_tokens = F.adaptive_avg_pool1d(
                 image_tokens.transpose(1, 2),
                 self.config.max_image_tokens,

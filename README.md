@@ -1,35 +1,119 @@
 # MiniVLA
 
-`minivla` 是一个独立的小型 VLA policy 包，接口尽量贴近 LeRobot batch 约定：
+MiniVLA is a pi0-style compact VLA stack for SO-101: patch-token observation
+memory + Flow Matching Action Expert + LeRobot training/deployment loop.
 
-- image token: 多视角 CLIP/ViT patch tokens + linear projector + camera embedding
-- text token: token embedding + attention mask，保留 token-level language memory
-- state token: proprioception/state linear projection，使用 `observation.state`
-- fusion: image/text/state/可选 metadata tokens concat 后接 observation Transformer
-- FMHead: 参考 openpi/pi0 的 flow matching 训练和 Euler denoise 推理
-- action expert: FMHead 内部使用轻量 DiT，以完整 observation memory conditioning 预测 action velocity
+MiniVLA is a compact LeRobot-compatible VLA policy project for SO-101 style
+robot experiments. The goal is not to reproduce the full scale of pi0/openpi,
+but to keep the same engineering shape at a smaller scale: multimodal
+observation tokens, an isolated action expert, flow-matching action generation,
+dataset normalization, checkpoint assets, and a policy server/client path.
 
-默认配置里保留了 `vlm_base_model_name="lerobot/smolvla_base"`，实际视觉编码器默认使用 `openai/clip-vit-base-patch32`。如果本机不能联网下载 HF 权重，可以把 `use_hf_vision_encoder=False`，会使用内置 patch-ViT fallback。
+The current mainline is a pi0-like lightweight policy:
 
-## Smoke Test
+- Vision: multi-camera CLIP/ViT patch tokens or an offline patch-ViT fallback.
+- Language: token-level task memory with attention masks.
+- State: proprioception/state token from `observation.state`.
+- Fusion: image/text/state/optional metadata tokens passed through an
+  observation Transformer.
+- Visual token control: adaptive pooling or a learnable query resampler for
+  compressing dense patch tokens into a fixed visual memory.
+- Action heads: configurable `mlp`, `query`, or `flow_matching` heads for
+  ablation; the mainline uses a DiT-style Flow Matching Action Expert.
+- Deployment smoothing: queued chunk execution or temporal action ensembling
+  over overlapping chunks.
+- Tooling: LeRobot dataset entry point, checkpoint restore, HTTP policy server,
+  evaluation, latency benchmark, data inspection, and SO-101 client scaffold.
+
+## Why This Project
+
+This repository is structured as a small but complete VLA engineering stack:
+
+1. Train on LeRobot-style data.
+2. Save config, normalizer statistics, and processor metadata into checkpoints.
+3. Restore the exact preprocessing path for inference.
+4. Serve a checkpoint through a simple policy API.
+5. Run robot-side safety filtering before sending actions to hardware.
+
+That mirrors the practical pieces that matter in pi0/openpi-style systems:
+data format discipline, action expert separation, flow-matching control, and
+deployment/evaluation plumbing.
+
+## Architecture
+
+```text
+LeRobot batch
+  observation.images.*  -> vision encoder -> camera-tagged image tokens
+  observation.language  -> text encoder   -> language memory tokens
+  observation.state     -> state encoder  -> proprioception token
+  optional metadata     -> small encoders -> metadata/subtask tokens
+                                                |
+                                                v
+                                  Observation Transformer memory
+                                                |
+                                                v
+                          DiT Action Expert + Flow Matching Head
+                                                |
+                                                v
+                                  action chunk [B, T, action_dim]
+```
+
+Key code paths:
+
+- Policy model: `src/minivla/modeling_minivla.py`
+- Flow-matching head: `src/minivla/fm_head.py`
+- Action head baselines: `src/minivla/action_heads.py`
+- Batch preprocessing: `src/minivla/transforms.py`
+- Training entry: `scripts/train.py`
+- Policy server: `scripts/serve_policy.py`
+- Robot client scaffold: `scripts/run_so101_policy.py`
+
+## pi0/openpi Correspondence
+
+| pi0/openpi idea | MiniVLA implementation |
+| --- | --- |
+| VLM prefix / observation memory | Image, language, state, metadata tokens + observation Transformer |
+| Visual token projector/resampler | `image_token_reduction=resampler` compresses dense patch tokens with learned queries |
+| Action Expert separated from semantic memory | `FMHead` owns a DiT-style action expert |
+| Flow Matching action generation | `x_t = t * noise + (1 - t) * action`, target velocity `noise - action` |
+| Action head ablations | `action_head=mlp`, `query`, or `flow_matching` |
+| Action chunking | `chunk_size` and `n_action_steps` config fields |
+| Overlapping chunk smoothing | `use_temporal_ensemble` averages aligned chunk predictions |
+| Dataset stats as deployment asset | Checkpoint stores `norm_stats` and normalizer metadata |
+| Policy server / robot client separation | `serve_policy.py` + `run_so101_policy.py` |
+| Small-model local iteration | `debug_tiny.yaml` and patch-ViT fallback |
+
+MiniVLA deliberately does not claim full pi0-scale pretraining. It is a
+research/engineering replica of the core control stack at SO-101 scale.
+
+## Quick Start
+
+Run the offline smoke test:
 
 ```bash
 /home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/smoke_test.py
 ```
 
-## Training
-
-`scripts/train.py` 提供了一个 LeRobot 数据集训练入口，包含 dataset stats normalizer、checkpoint save/load 和基础命令行配置：
+Train from a YAML preset:
 
 ```bash
 /home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train.py \
+  --config configs/so101_front_wrist.yaml \
   --dataset-repo-id your_org/your_lerobot_dataset \
-  --output-dir outputs/minivla \
-  --batch-size 8 \
-  --max-steps 10000
+  --output-dir outputs/minivla
 ```
 
-恢复训练：
+Command-line flags override YAML values:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train.py \
+  --config configs/debug_tiny.yaml \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --max-steps 200 \
+  --batch-size 4
+```
+
+Resume from a checkpoint:
 
 ```bash
 /home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train.py \
@@ -38,7 +122,9 @@
   --use-checkpoint-config
 ```
 
-训练 checkpoint 会保存 `config`、`norm_stats`、兼容旧字段的 `dataset_stats`，以及 processor/tokenizer/normalizer metadata。推理时可以用同一套 transform 路径恢复：
+## Inference
+
+Load a checkpoint in Python:
 
 ```python
 from minivla import MiniVLAPolicyRunner
@@ -47,7 +133,15 @@ runner = MiniVLAPolicyRunner.from_checkpoint("outputs/minivla/last.pt")
 actions = runner.infer(observation)["actions"]
 ```
 
-也可以启动轻量 HTTP policy server：
+Use a LeRobot-style pretrained directory:
+
+```python
+runner.save_pretrained("outputs/minivla_pretrained")
+runner = MiniVLAPolicyRunner.from_pretrained("outputs/minivla_pretrained")
+action = runner.select_action(observation)["action"]
+```
+
+Start the HTTP policy server:
 
 ```bash
 /home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/serve_policy.py \
@@ -55,60 +149,133 @@ actions = runner.infer(observation)["actions"]
   --port 8010
 ```
 
-## Minimal Usage
+Run the SO-101 client scaffold in dry-run mode:
 
-```python
-import torch
-from minivla import MiniVLAConfig, MiniVLAPolicy
-from minivla.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
-
-cfg = MiniVLAConfig(
-    use_hf_vision_encoder=False,
-    image_keys=("observation.images.front",),
-    max_state_dim=14,
-    max_action_dim=14,
-    action_dim=14,
-    chunk_size=16,
-)
-policy = MiniVLAPolicy(cfg)
-
-batch = {
-    "observation.images.front": torch.rand(2, 3, 224, 224),
-    OBS_LANGUAGE_TOKENS: torch.randint(0, cfg.text_vocab_size, (2, 12)),
-    OBS_LANGUAGE_ATTENTION_MASK: torch.ones(2, 12, dtype=torch.bool),
-    OBS_STATE: torch.randn(2, 14),
-    ACTION: torch.randn(2, cfg.chunk_size, 14),
-}
-
-loss, info = policy(batch)
-actions = policy.predict_action_chunk({k: v for k, v in batch.items() if k != ACTION})
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/run_so101_policy.py \
+  --policy-url http://127.0.0.1:8010/infer \
+  --observation-json path/to/so101_observation.json \
+  --dry-run
 ```
 
-动作由 `FMHead` 生成：训练时采样噪声 `noise` 和时间 `t`，构造
-`x_t = t * noise + (1 - t) * action`，让 DiT action expert 预测 velocity
-`noise - action`；推理时从高斯噪声开始，用 Euler denoise 积分得到完整 action chunk。
+`run_so101_policy.py` includes action clamp, joint-limit checking, EMA smoothing,
+emergency-stop file polling, and frequency/latency logging. The hardware adapter
+is intentionally explicit: real SO-101 read/write methods should be connected
+there instead of being hidden in the policy code.
 
-loss 是 masked MSE，只计算有效 action step。batch 里可以传 LeRobot 风格的
-`action_is_pad`，其中 `True` 表示该 step 是 padding，不参与 loss：
+To let the server perform policy-side chunk queueing or temporal ensembling,
+start the same server and pass:
 
-```python
-batch["action_is_pad"] = torch.zeros(2, cfg.chunk_size, dtype=torch.bool)
-batch["action_is_pad"][0, -2:] = True
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/run_so101_policy.py \
+  --policy-url http://127.0.0.1:8010/infer \
+  --observation-json path/to/so101_observation.json \
+  --server-select-action \
+  --dry-run
 ```
 
-`policy.fm_head` 可以单独使用：输入 observation memory tokens，输出完整 padded action chunk：
+## Evaluation Tools
 
-```python
-obs_tokens = policy.encode_observation_tokens({k: v for k, v in batch.items() if k != ACTION})
-padded_actions = policy.fm_head.sample(obs_tokens)
+Inspect a LeRobot dataset:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/inspect_lerobot_dataset.py \
+  --dataset-repo-id your_org/your_lerobot_dataset
 ```
 
-可选 metadata / auxiliary 输入：
+Evaluate checkpoint loss on held-out batches:
 
-- `episode.success`、`episode.quality` 会被编码成一个 episode metadata token。
-- `subtask.label` 会被 processor tokenized 成 `subtask.tokens`，并作为额外 language memory。
-- 设置 `future_latent_loss_weight > 0` 且 batch 提供 `future.image` 时，会启用轻量 future latent auxiliary loss。
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/evaluate_policy.py \
+  --checkpoint outputs/minivla/last.pt \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --max-batches 20
+```
 
-## Notes
+This prints action-head-neutral diagnostics:
 
-训练数据预处理可以直接沿用 LeRobot 的命名方式：图像键用 `observation.images.*`，关节/末端状态放 `observation.state`，动作放 `action`，语言 tokens 放 `observation.language.tokens`，mask 放 `observation.language.attention_mask`。`transforms.py` 负责 repack、resize、pad、normalize / unnormalize 和 tokenize 调度。
+```text
+mean_fm_loss=
+mean_sampled_action_mse=
+mean_action_smoothness=
+mean_action_jerk=
+latency_ms=
+```
+
+Benchmark inference latency:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/benchmark_latency.py \
+  --checkpoint outputs/minivla/last.pt \
+  --warmup 10 \
+  --iters 100
+```
+
+Plot generated or recorded action chunks:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/plot_action_chunks.py \
+  --actions outputs/action_chunk.pt \
+  --output outputs/action_chunk.png
+```
+
+Run the local project check:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/check_project.py
+```
+
+## Config Presets
+
+- `configs/debug_tiny.yaml`: fast CPU/GPU sanity check.
+- `configs/so101_front.yaml`: single front-camera SO-101 setup.
+- `configs/so101_front_wrist.yaml`: front + wrist camera setup.
+- `configs/so101_pi0_like.yaml`: larger pi0-like MiniVLA preset with frozen
+  pretrained vision encoder, learnable visual resampler, FM action expert, and
+  temporal action ensemble enabled.
+- `configs/ablation_mlp.yaml`: direct pooled-memory MLP action baseline.
+- `configs/ablation_query.yaml`: ACT-style action query decoder baseline.
+
+## Batch Schema
+
+Training data follows LeRobot-style names:
+
+- Images: `observation.images.front`, `observation.images.wrist`, ...
+- State: `observation.state`
+- Action chunk: `action`
+- Language tokens: `observation.language.tokens`
+- Language mask: `observation.language.attention_mask`
+- Optional task string: `task`
+- Optional action padding: `action_is_pad`
+- Optional metadata: `episode.success`, `episode.quality`, `subtask.label`,
+  `future.image`
+
+`src/minivla/transforms.py` handles key repacking, image conversion, resize,
+normalization, action/state padding, and tokenization.
+
+## Current Scope
+
+Implemented:
+
+- LeRobot-compatible batch path.
+- Multi-camera observation memory.
+- Learnable visual token resampler.
+- Configurable MLP, query-decoder, and flow-matching action heads.
+- Flow-matching DiT action expert as the mainline.
+- Temporal action ensemble for overlapping chunks.
+- Masked action loss.
+- Checkpoint save/load with normalizer metadata.
+- `save_pretrained` / `from_pretrained` runner API.
+- Generated `model_card.md` for saved pretrained directories.
+- Local project check script.
+- HTTP policy server.
+- Config presets.
+- Dataset inspection, evaluation, latency, and plotting utilities.
+- SO-101 safety client scaffold.
+
+Not claimed yet:
+
+- Full pi0-scale VLM pretraining.
+- Verified cross-task generalization.
+- Published real-robot success rates.
+- Production-ready SO-101 hardware driver.

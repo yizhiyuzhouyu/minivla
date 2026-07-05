@@ -23,6 +23,8 @@ class MiniVLAConfig:
     freeze_vision_encoder: bool = True
     patch_size: int = 16
     max_image_tokens: int | None = None
+    image_token_reduction: str = "adaptive_pool"
+    visual_resampler_layers: int = 1
 
     text_vocab_size: int = 49152
     tokenizer_max_length: int = 48
@@ -32,9 +34,13 @@ class MiniVLAConfig:
     n_obs_steps: int = 1
     chunk_size: int = 50
     n_action_steps: int = 50
+    action_head: str = "flow_matching"
     max_state_dim: int = 32
     max_action_dim: int = 32
     action_dim: int | None = None
+    use_temporal_ensemble: bool = False
+    temporal_ensemble_max_chunks: int = 8
+    temporal_ensemble_decay: float = 0.5
     use_episode_metadata: bool = False
     future_latent_loss_weight: float = 0.0
 
@@ -68,11 +74,21 @@ class MiniVLAConfig:
             self.action_dim = self.max_action_dim
         if self.action_dim <= 0 or self.action_dim > self.max_action_dim:
             raise ValueError("action_dim must be in (0, max_action_dim]")
+        if self.action_head not in {"flow_matching", "mlp", "query"}:
+            raise ValueError("action_head must be 'flow_matching', 'mlp', or 'query'")
         if self.future_latent_loss_weight < 0:
             raise ValueError("future_latent_loss_weight must be non-negative")
         if self.hidden_dim % self.num_heads != 0:
             raise ValueError("hidden_dim must be divisible by num_heads")
         if self.image_size[0] % self.patch_size != 0 or self.image_size[1] % self.patch_size != 0:
             raise ValueError("image_size must be divisible by patch_size")
+        if self.image_token_reduction not in {"adaptive_pool", "resampler"}:
+            raise ValueError("image_token_reduction must be 'adaptive_pool' or 'resampler'")
+        if self.visual_resampler_layers <= 0:
+            raise ValueError("visual_resampler_layers must be positive")
+        if self.temporal_ensemble_max_chunks <= 0:
+            raise ValueError("temporal_ensemble_max_chunks must be positive")
+        if self.temporal_ensemble_decay < 0:
+            raise ValueError("temporal_ensemble_decay must be non-negative")
         if self.dtype not in {"float32", "bfloat16"}:
             raise ValueError("dtype must be 'float32' or 'bfloat16'")

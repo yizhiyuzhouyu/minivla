@@ -19,3 +19,7 @@ dist/
 *.egg-info/
 
 .DS_Store
+
+# Local personal/reference PDFs
+天津大学-刘笑宇-算法工程师.pdf
+自用版mini_vla升级ppt.pdf

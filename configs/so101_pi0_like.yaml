@@ -1,0 +1,49 @@
+dataset_repo_id: null
+output_dir: outputs/so101_pi0_like
+device: cuda
+dtype: bfloat16
+batch_size: 4
+num_workers: 4
+epochs: 1
+max_steps: 20000
+lr: 0.00005
+weight_decay: 0.0001
+grad_clip_norm: 1.0
+log_every: 10
+save_every: 1000
+seed: 0
+
+normalize_state: true
+normalize_action: true
+delta_timestamps: true
+fps: 30.0
+
+use_hf_vision_encoder: true
+freeze_vision_encoder: true
+vision_model_name: openai/clip-vit-base-patch32
+tokenizer_name: HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+image_keys:
+  - observation.images.front
+  - observation.images.wrist
+image_size: [224, 224]
+patch_size: 16
+image_token_reduction: resampler
+visual_resampler_layers: 2
+hidden_dim: 512
+num_heads: 8
+num_dit_layers: 6
+action_head: flow_matching
+chunk_size: 50
+n_action_steps: 25
+max_state_dim: 32
+max_action_dim: 32
+action_dim: 7
+use_temporal_ensemble: true
+temporal_ensemble_max_chunks: 8
+temporal_ensemble_decay: 0.5
+text_vocab_size: 49152
+tokenizer_max_length: 48
+num_inference_steps: 10
+max_image_tokens: 256
+use_episode_metadata: true
+future_latent_loss_weight: 0.05

@@ -1,0 +1,46 @@
+dataset_repo_id: null
+output_dir: outputs/debug_tiny
+device: cpu
+dtype: float32
+batch_size: 2
+num_workers: 0
+epochs: 1
+max_steps: 20
+lr: 0.0001
+weight_decay: 0.0001
+grad_clip_norm: 1.0
+log_every: 1
+save_every: 0
+seed: 0
+
+normalize_state: true
+normalize_action: true
+delta_timestamps: true
+fps: 30.0
+
+use_hf_vision_encoder: false
+freeze_vision_encoder: true
+image_keys:
+  - observation.images.front
+image_size: [64, 64]
+patch_size: 16
+image_token_reduction: adaptive_pool
+visual_resampler_layers: 1
+hidden_dim: 64
+num_heads: 4
+num_dit_layers: 2
+action_head: flow_matching
+chunk_size: 8
+n_action_steps: 4
+max_state_dim: 10
+max_action_dim: 10
+action_dim: 7
+use_temporal_ensemble: false
+temporal_ensemble_max_chunks: 4
+temporal_ensemble_decay: 0.5
+text_vocab_size: 128
+tokenizer_max_length: 16
+num_inference_steps: 2
+max_image_tokens: null
+use_episode_metadata: false
+future_latent_loss_weight: 0.0
