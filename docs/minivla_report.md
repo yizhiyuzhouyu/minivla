@@ -45,6 +45,12 @@ MiniVLA currently contains:
   - `query`: ACT-style action query decoder baseline.
   - `flow_matching`: DiT-style Flow Matching Action Expert mainline.
 - Temporal action ensemble for overlapping chunks.
+- Post-SFT policy refinement:
+  - validation scorecard checkpoint selection.
+  - reusable action safety postprocess.
+  - trainable runtime refinement heads.
+  - FM inference and execution-parameter calibration.
+  - failure-case mining for re-SFT / recovery data / future RL.
 - LeRobot-compatible training, checkpoint, evaluation, server, and SO-101
   client scaffold.
 
@@ -55,9 +61,27 @@ MiniVLA currently contains:
 - `src/minivla/fm_head.py`: DiT-style flow-matching action expert.
 - `src/minivla/action_heads.py`: MLP and query-decoder baselines.
 - `src/minivla/transforms.py`: LeRobot batch preparation and normalization.
+- `src/minivla/postprocess.py`: action unnormalization hooks, action-dim
+  selection, NaN/Inf guard, clamp, max-delta limiting, joint-limit projection,
+  EMA smoothing, and latency monitoring.
+- `src/minivla/refinement_heads.py`: `ActionProbe`, `ActionVerifierHead`,
+  `AdaptiveHorizonHead`, `ResidualRecoveryPolicy`, and
+  `PostSFTRefinementStack` for ablatable frozen-policy refinement.
 - `src/minivla/policy.py`: checkpoint restore, `from_pretrained`,
   `save_pretrained`, `infer`, and `select_action`.
 - `scripts/train.py`: YAML/CLI training entry.
+- `scripts/post_sft_select_checkpoint.py`: validation scorecard checkpoint
+  selection and failure-case logging.
+- `scripts/post_sft_calibrate.py`: post-SFT FM denoise-step and action
+  postprocess calibration.
+- `scripts/train_refinement_heads.py`: trains post-SFT refinement heads from
+  frozen MiniVLA predictions and pseudo-labels before real rollout labels are
+  available.
+- `scripts/evaluate_refinement_heads.py`: evaluates refinement ablations and
+  writes `report.json` plus `table.md`.
+- `scripts/log_rollout.py`: logs policy responses, postprocessed actions,
+  refinement diagnostics, safety-filter info, and optional human labels for
+  failure mining.
 - `scripts/serve_policy.py`: HTTP policy server.
 - `scripts/run_so101_policy.py`: robot-side safety client scaffold.
 - `scripts/evaluate_policy.py`: offline loss evaluation.
@@ -86,6 +110,18 @@ diagnostics:
 - Benchmark denoising steps versus latency.
 - Compare adaptive pooling versus visual resampler.
 - Compare queued action chunks versus temporal action ensemble.
+- Run post-SFT checkpoint selection instead of deploying `last.pt` by default.
+- Sweep `num_inference_steps`, `n_action_steps`, EMA, max-delta, action clamp,
+  and temporal-ensemble settings to find an MSE/smoothness/jerk/latency Pareto
+  point.
+- Mine `failure_cases.jsonl` for high-loss, high-jerk, saturation, command
+  jump, and per-episode failure patterns.
+- Compare refinement ablations: action-only probe, probe + verifier, adaptive
+  horizon, and residual recovery.
+- Log dry-runs and real rollouts into JSONL, then replace pseudo-labels with
+  rollout human labels or heuristic safety events.
+- Use failure cases to collect recovery demonstrations, reweight SFT, and later
+  add a constrained RL stage initialized from the SFT checkpoint.
 - Add a small SO-101 real-robot task once data collection is available.
 
 ## Risks And Limits

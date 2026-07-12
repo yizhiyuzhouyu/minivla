@@ -33,6 +33,7 @@ hidden_dim: 512
 num_heads: 8
 num_dit_layers: 6
 action_head: flow_matching
+n_obs_steps: 2
 chunk_size: 50
 n_action_steps: 25
 max_state_dim: 32
@@ -47,3 +48,4 @@ num_inference_steps: 10
 max_image_tokens: 256
 use_episode_metadata: true
 future_latent_loss_weight: 0.05
+fm_action_smoothness_loss_weight: 0.0

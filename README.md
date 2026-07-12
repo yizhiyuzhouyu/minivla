@@ -11,9 +11,12 @@ dataset normalization, checkpoint assets, and a policy server/client path.
 
 The current mainline is a pi0-like lightweight policy:
 
-- Vision: multi-camera CLIP/ViT patch tokens or an offline patch-ViT fallback.
-- Language: token-level task memory with attention masks.
-- State: proprioception/state token from `observation.state`.
+- Vision: multi-camera CLIP/ViT patch tokens or an offline patch-ViT fallback;
+  Hugging Face vision backbones use their pretrained image mean/std.
+- Language: token-level task memory with attention masks, trained from scratch
+  as a compact task embedding rather than a full pretrained language model.
+- State: proprioception/state token from `observation.state`; temporal state
+  windows are flattened when `n_obs_steps > 1`.
 - Fusion: image/text/state/optional metadata tokens passed through an
   observation Transformer.
 - Visual token control: adaptive pooling or a learnable query resampler for
@@ -22,6 +25,9 @@ The current mainline is a pi0-like lightweight policy:
   ablation; the mainline uses a DiT-style Flow Matching Action Expert.
 - Deployment smoothing: queued chunk execution or temporal action ensembling
   over overlapping chunks.
+- Post-SFT refinement: validation scorecard checkpoint selection, action
+  safety postprocess, trainable refinement heads, inference calibration, and
+  failure-case mining for re-SFT/RL.
 - Tooling: LeRobot dataset entry point, checkpoint restore, HTTP policy server,
   evaluation, latency benchmark, data inspection, and SO-101 client scaffold.
 
@@ -63,8 +69,15 @@ Key code paths:
 - Policy model: `src/minivla/modeling_minivla.py`
 - Flow-matching head: `src/minivla/fm_head.py`
 - Action head baselines: `src/minivla/action_heads.py`
+- Post-SFT action postprocess: `src/minivla/postprocess.py`
+- Post-SFT refinement heads: `src/minivla/refinement_heads.py`
 - Batch preprocessing: `src/minivla/transforms.py`
 - Training entry: `scripts/train.py`
+- Post-SFT checkpoint selection: `scripts/post_sft_select_checkpoint.py`
+- Post-SFT calibration: `scripts/post_sft_calibrate.py`
+- Post-SFT refinement head training: `scripts/train_refinement_heads.py`
+- Post-SFT refinement evaluation: `scripts/evaluate_refinement_heads.py`
+- Rollout logger: `scripts/log_rollout.py`
 - Policy server: `scripts/serve_policy.py`
 - Robot client scaffold: `scripts/run_so101_policy.py`
 
@@ -72,12 +85,13 @@ Key code paths:
 
 | pi0/openpi idea | MiniVLA implementation |
 | --- | --- |
-| VLM prefix / observation memory | Image, language, state, metadata tokens + observation Transformer |
+| VLM prefix / observation memory | Image, learned task-token, state, metadata tokens + observation Transformer |
 | Visual token projector/resampler | `image_token_reduction=resampler` compresses dense patch tokens with learned queries |
 | Action Expert separated from semantic memory | `FMHead` owns a DiT-style action expert |
 | Flow Matching action generation | `x_t = t * noise + (1 - t) * action`, target velocity `noise - action` |
 | Action head ablations | `action_head=mlp`, `query`, or `flow_matching` |
 | Action chunking | `chunk_size` and `n_action_steps` config fields |
+| Observation history | `n_obs_steps` requests multi-frame image/state windows from LeRobot |
 | Overlapping chunk smoothing | `use_temporal_ensemble` averages aligned chunk predictions |
 | Dataset stats as deployment asset | Checkpoint stores `norm_stats` and normalizer metadata |
 | Policy server / robot client separation | `serve_policy.py` + `run_so101_policy.py` |
@@ -102,6 +116,29 @@ Train from a YAML preset:
   --dataset-repo-id your_org/your_lerobot_dataset \
   --output-dir outputs/minivla
 ```
+
+Train with an in-loop validation split and quality-aware SFT options:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train.py \
+  --config configs/so101_pi0_like.yaml \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --split-json path/to/so101_train.json \
+  --val-split-json configs/splits/so101_val.json \
+  --eval-every 1000 \
+  --use-quality-weights \
+  --loss-clip 2.0 \
+  --fm-action-smoothness-loss-weight 0.01
+```
+
+This writes `train_log.jsonl`, `train_log.csv`, `last.pt`, and validation-selected
+`best.pt` under the output directory.
+
+Training-time validation logs keep `mean_sampled_action_mse` as a normalized
+training-space proxy and also write `mean_sampled_action_mse_original` after
+unnormalizing actions with checkpoint stats. Post-SFT selection and calibration
+use original action-space MSE, smoothness, jerk, saturation, and command-jump
+metrics because those correspond to deployment commands.
 
 Command-line flags override YAML values:
 
@@ -197,6 +234,8 @@ This prints action-head-neutral diagnostics:
 ```text
 mean_fm_loss=
 mean_sampled_action_mse=
+mean_sampled_action_mse_normalized=
+mean_sampled_action_mse_original=
 mean_action_smoothness=
 mean_action_jerk=
 latency_ms=
@@ -209,6 +248,77 @@ Benchmark inference latency:
   --checkpoint outputs/minivla/last.pt \
   --warmup 10 \
   --iters 100
+```
+
+Run post-SFT checkpoint selection:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/post_sft_select_checkpoint.py \
+  --checkpoint-glob "outputs/minivla/step_*.pt" \
+  --checkpoints outputs/minivla/last.pt \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --output-dir outputs/post_sft
+```
+
+Calibrate FM inference and action postprocess settings:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/post_sft_calibrate.py \
+  --checkpoint outputs/post_sft/best.pt \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --output-dir outputs/post_sft
+```
+
+Replay a validation sequence through the same `select_action()` queue/temporal
+ensemble path used at deployment:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/replay_policy_sequence.py \
+  --checkpoint outputs/post_sft/best.pt \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --split-json configs/splits/so101_val.json \
+  --output-dir outputs/replay_val
+```
+
+Train post-SFT refinement heads while keeping the base policy frozen:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train_refinement_heads.py \
+  --checkpoint outputs/post_sft/best.pt \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --preset probe_verifier_horizon \
+  --output-dir outputs/refinement_probe_verifier_horizon
+```
+
+Evaluate refinement head ablations and write a report/table:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/evaluate_refinement_heads.py \
+  --checkpoint outputs/post_sft/best.pt \
+  --refinement probe=outputs/refinement_probe/last.pt \
+  --refinement pvh=outputs/refinement_probe_verifier_horizon/last.pt \
+  --dataset-repo-id your_org/your_lerobot_dataset \
+  --split-json configs/splits/so101_val.json \
+  --output-dir outputs/refinement_ablation
+```
+
+Serve a policy with post-SFT refinement diagnostics:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/serve_policy.py \
+  --checkpoint outputs/post_sft/best.pt \
+  --refinement-checkpoint outputs/refinement_probe_verifier_horizon/last.pt \
+  --port 8010
+```
+
+Log rollout or dry-run steps for failure mining:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/log_rollout.py \
+  --policy-url http://127.0.0.1:8010/infer \
+  --observation-json path/to/so101_observation.json \
+  --output outputs/rollouts/debug.jsonl \
+  --dry-run
 ```
 
 Plot generated or recorded action chunks:
@@ -253,12 +363,21 @@ Training data follows LeRobot-style names:
 `src/minivla/transforms.py` handles key repacking, image conversion, resize,
 normalization, action/state padding, and tokenization.
 
+When `delta_timestamps` is enabled, training and evaluation request the full
+action chunk plus `n_obs_steps` image/state history from LeRobot. The default
+SO-101 presets use `n_obs_steps: 2`; override with `--n-obs-steps 1` if a
+dataset only supports single-frame observations.
+
+`future.image` is optional. The `future_latent_loss_weight` setting only has an
+effect when that key exists in the prepared batch.
+
 ## Current Scope
 
 Implemented:
 
 - LeRobot-compatible batch path.
 - Multi-camera observation memory.
+- Multi-frame observation history through `n_obs_steps`.
 - Learnable visual token resampler.
 - Configurable MLP, query-decoder, and flow-matching action heads.
 - Flow-matching DiT action expert as the mainline.
@@ -271,11 +390,21 @@ Implemented:
 - HTTP policy server.
 - Config presets.
 - Dataset inspection, evaluation, latency, and plotting utilities.
+- Post-SFT checkpoint selection, action postprocess, calibration, and failure
+  mining.
+- Trainable post-SFT refinement heads: action probe, observation-conditioned
+  verifier, adaptive horizon predictor, and optional residual recovery policy.
+- Refinement ablation report generation and rollout logging for future
+  recovery-data or constrained-RL loops.
 - SO-101 safety client scaffold.
 
 Not claimed yet:
 
 - Full pi0-scale VLM pretraining.
+- Pretrained LLM/VLM language understanding; language tokens are learned task
+  embeddings in this compact stack.
 - Verified cross-task generalization.
 - Published real-robot success rates.
+- Evidence that pseudo-labeled refinement heads improve real rollout success
+  without held-out rollout or human-label validation.
 - Production-ready SO-101 hardware driver.

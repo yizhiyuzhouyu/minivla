@@ -14,11 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from minivla import MiniVLAPolicyRunner
 from minivla.constants import ACTION
+from minivla.splits import load_episode_split
 from minivla.transforms import prepare_batch
-from train import collate_batch
+from train import build_delta_timestamps, collate_batch
 
 
-def load_lerobot_dataset(args: argparse.Namespace):
+def load_lerobot_dataset(args: argparse.Namespace, runner: MiniVLAPolicyRunner):
     try:
         from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
     except ImportError:
@@ -27,11 +28,22 @@ def load_lerobot_dataset(args: argparse.Namespace):
         except ImportError as exc:
             raise ImportError("Could not import LeRobotDataset. Install LeRobot first.") from exc
 
+    episodes = args.episodes
+    split_episodes = load_episode_split(args.split_json, args.split_name)
+    if split_episodes is not None:
+        episodes = split_episodes
     kwargs: dict[str, Any] = {}
     if args.dataset_root is not None:
         kwargs["root"] = args.dataset_root
-    if args.episodes is not None:
-        kwargs["episodes"] = args.episodes
+    if episodes is not None:
+        kwargs["episodes"] = episodes
+    if args.delta_timestamps:
+        kwargs["delta_timestamps"] = build_delta_timestamps(
+            runner.policy.config.chunk_size,
+            runner.policy.config.n_obs_steps,
+            args.fps,
+            runner.policy.config.image_keys,
+        )
     return LeRobotDataset(args.dataset_repo_id, **kwargs)
 
 
@@ -53,15 +65,19 @@ def main() -> None:
     parser.add_argument("--dataset-repo-id", required=True)
     parser.add_argument("--dataset-root", default=None)
     parser.add_argument("--episodes", type=int, nargs="*", default=None)
+    parser.add_argument("--split-json", default=None)
+    parser.add_argument("--split-name", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-batches", type=int, default=20)
     parser.add_argument("--sample-actions", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--delta-timestamps", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fps", type=float, default=30.0)
     args = parser.parse_args()
 
     runner = MiniVLAPolicyRunner.from_checkpoint(args.checkpoint, device=args.device)
-    dataset = load_lerobot_dataset(args)
+    dataset = load_lerobot_dataset(args, runner)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -74,6 +90,7 @@ def main() -> None:
 
     losses: list[float] = []
     action_mses: list[float] = []
+    action_mses_original: list[float] = []
     smoothness_values: list[float] = []
     jerk_values: list[float] = []
     latencies_ms: list[float] = []
@@ -104,6 +121,9 @@ def main() -> None:
                 pred = pred[:, :steps]
                 target = target[:, :steps]
                 action_mses.append(float(torch.mean((pred - target) ** 2).detach().cpu()))
+                pred_original = runner.normalizer.unnormalize_actions(pred)
+                target_original = runner.normalizer.unnormalize_actions(target)
+                action_mses_original.append(float(torch.mean((pred_original - target_original) ** 2).detach().cpu()))
                 smoothness_values.append(float(action_smoothness(pred).detach().cpu()))
                 jerk_values.append(float(action_jerk(pred).detach().cpu()))
 
@@ -116,11 +136,14 @@ def main() -> None:
     print(f"mean_fm_loss={mean_loss:.6f}")
     if action_mses:
         mean_action_mse = sum(action_mses) / len(action_mses)
+        mean_action_mse_original = sum(action_mses_original) / len(action_mses_original)
         mean_smoothness = sum(smoothness_values) / len(smoothness_values)
         mean_jerk = sum(jerk_values) / len(jerk_values)
         mean_latency_ms = sum(latencies_ms) / len(latencies_ms)
         print(f"sampled_batches={len(action_mses)}")
         print(f"mean_sampled_action_mse={mean_action_mse:.6f}")
+        print(f"mean_sampled_action_mse_normalized={mean_action_mse:.6f}")
+        print(f"mean_sampled_action_mse_original={mean_action_mse_original:.6f}")
         print(f"mean_action_smoothness={mean_smoothness:.6f}")
         print(f"mean_action_jerk={mean_jerk:.6f}")
         print(f"latency_ms={mean_latency_ms:.3f}")

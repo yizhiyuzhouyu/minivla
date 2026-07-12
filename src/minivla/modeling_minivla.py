@@ -80,11 +80,12 @@ class HFVisionEncoder(nn.Module):
     def __init__(self, config: MiniVLAConfig):
         super().__init__()
         try:
-            from transformers import AutoConfig, AutoModel, CLIPVisionModel
+            from transformers import AutoConfig, AutoImageProcessor, AutoModel, CLIPVisionModel
         except ImportError as exc:
             raise ImportError("transformers is required when use_hf_vision_encoder=True") from exc
 
         hf_config = AutoConfig.from_pretrained(config.vision_model_name)
+        processor = AutoImageProcessor.from_pretrained(config.vision_model_name)
         if getattr(hf_config, "model_type", None) == "clip":
             self.backbone = CLIPVisionModel.from_pretrained(config.vision_model_name)
         else:
@@ -92,6 +93,10 @@ class HFVisionEncoder(nn.Module):
         hidden_size = self.backbone.config.hidden_size
         self.projector = nn.Linear(hidden_size, config.hidden_dim)
         self.image_size = config.image_size
+        image_mean = getattr(processor, "image_mean", None) or [0.48145466, 0.4578275, 0.40821073]
+        image_std = getattr(processor, "image_std", None) or [0.26862954, 0.26130258, 0.27577711]
+        self.register_buffer("image_mean", torch.tensor(image_mean, dtype=torch.float32).view(1, -1, 1, 1), persistent=False)
+        self.register_buffer("image_std", torch.tensor(image_std, dtype=torch.float32).view(1, -1, 1, 1), persistent=False)
 
         if config.freeze_vision_encoder:
             for param in self.backbone.parameters():
@@ -100,6 +105,11 @@ class HFVisionEncoder(nn.Module):
     def forward(self, images: Tensor) -> Tensor:
         if images.shape[-2:] != self.image_size:
             images = F.interpolate(images, size=self.image_size, mode="bilinear", align_corners=False)
+        images = images.to(dtype=torch.float32)
+        image_mean = self.image_mean.to(device=images.device, dtype=torch.float32)
+        image_std = self.image_std.to(device=images.device, dtype=torch.float32).clamp_min(1e-6)
+        images = (images - image_mean) / image_std
+        images = images.to(dtype=next(self.backbone.parameters()).dtype)
 
         outputs = self.backbone(pixel_values=images)
         if hasattr(outputs, "last_hidden_state"):
@@ -207,6 +217,7 @@ class MiniVLAPolicy(nn.Module):
         self.text_encoder = TextTokenEncoder(config)
         self.state_encoder = StateEncoder(config)
         self.camera_embedding = nn.Embedding(max(1, len(config.image_keys)), config.hidden_dim)
+        self.obs_temporal_embedding = nn.Embedding(max(1, config.n_obs_steps), config.hidden_dim)
         self.image_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
         self.text_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
         self.state_modality = nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
@@ -493,11 +504,28 @@ class MiniVLAPolicy(nn.Module):
         image_tensors = self.prepare_images(batch, keys=keys)
         encoded = []
         for index, image in enumerate(image_tensors):
-            tokens = self.vision_encoder(image)
-            if add_camera:
-                camera_index = min(index, self.camera_embedding.num_embeddings - 1)
-                tokens = tokens + self.camera_embedding.weight[camera_index][None, None, :]
-            encoded.append(tokens)
+            if image.ndim == 5:
+                batch_size, steps, channels, height, width = image.shape
+                flat_image = image.reshape(batch_size * steps, channels, height, width)
+                tokens = self.vision_encoder(flat_image)
+                tokens = tokens.reshape(batch_size, steps, tokens.shape[1], tokens.shape[2])
+                if add_camera:
+                    camera_index = min(index, self.camera_embedding.num_embeddings - 1)
+                    tokens = tokens + self.camera_embedding.weight[camera_index][None, None, None, :]
+                temporal_count = min(steps, self.obs_temporal_embedding.num_embeddings)
+                temporal_start = self.obs_temporal_embedding.num_embeddings - temporal_count
+                temporal = self.obs_temporal_embedding.weight[temporal_start : temporal_start + temporal_count]
+                if steps > temporal_count:
+                    pad = temporal[:1].expand(steps - temporal_count, -1)
+                    temporal = torch.cat([pad, temporal], dim=0)
+                tokens = tokens + temporal.to(device=tokens.device, dtype=tokens.dtype)[None, :, None, :]
+                encoded.append(tokens.flatten(1, 2))
+            else:
+                tokens = self.vision_encoder(image)
+                if add_camera:
+                    camera_index = min(index, self.camera_embedding.num_embeddings - 1)
+                    tokens = tokens + self.camera_embedding.weight[camera_index][None, None, :]
+                encoded.append(tokens)
         return torch.cat(encoded, dim=1)
 
     def prepare_images(self, batch: dict[str, Tensor], keys: tuple[str, ...] | None = None) -> list[Tensor]:
@@ -511,9 +539,7 @@ class MiniVLAPolicy(nn.Module):
         images = []
         for key in keys:
             image = batch[key]
-            if image.ndim == 5:
-                image = image[:, -1]
-            if image.ndim != 4:
+            if image.ndim not in {4, 5}:
                 raise ValueError(f"Image {key} must have shape (B,C,H,W) or (B,T,C,H,W), got {tuple(image.shape)}")
             images.append(image.to(dtype=next(self.parameters()).dtype))
         return images
@@ -523,7 +549,7 @@ class MiniVLAPolicy(nn.Module):
             raise KeyError(f"Missing {OBS_STATE}")
         state = batch[OBS_STATE]
         if state.ndim == 3:
-            state = state[:, -1]
+            state = state.flatten(start_dim=1)
         if state.ndim != 2:
             raise ValueError(f"{OBS_STATE} must have shape (B,D) or (B,T,D), got {tuple(state.shape)}")
         return pad_vector(state, self.config.max_state_dim).to(dtype=next(self.parameters()).dtype)

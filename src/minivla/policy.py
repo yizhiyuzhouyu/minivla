@@ -11,6 +11,7 @@ import torch
 from minivla.configuration_minivla import MiniVLAConfig
 from minivla.modeling_minivla import MiniVLAPolicy
 from minivla.processor import MiniVLAProcessor
+from minivla.refinement_heads import PostSFTRefinementStack
 from minivla.transforms import BatchNormalizer, prepare_batch
 
 
@@ -42,6 +43,7 @@ class MiniVLAPolicyRunner:
         cls,
         checkpoint_path: str | Path,
         device: torch.device | str | None = None,
+        refinement_checkpoint: str | Path | None = None,
     ) -> "MiniVLAPolicyRunner":
         checkpoint_path = Path(checkpoint_path)
         if checkpoint_path.is_dir():
@@ -63,15 +65,19 @@ class MiniVLAPolicyRunner:
             normalize_state=bool(normalizer_assets.get("normalize_state", assets.get("normalize_state", True))),
             normalize_action=bool(normalizer_assets.get("normalize_action", assets.get("normalize_action", True))),
         )
-        return cls(policy, processor, normalizer, device=device, assets=assets)
+        runner = cls(policy, processor, normalizer, device=device, assets=assets)
+        if refinement_checkpoint is not None:
+            return MiniVLARefinedPolicyRunner.from_runner(runner, refinement_checkpoint)
+        return runner
 
     @classmethod
     def from_pretrained(
         cls,
         pretrained_path: str | Path,
         device: torch.device | str | None = None,
+        refinement_checkpoint: str | Path | None = None,
     ) -> "MiniVLAPolicyRunner":
-        return cls.from_checkpoint(pretrained_path, device=device)
+        return cls.from_checkpoint(pretrained_path, device=device, refinement_checkpoint=refinement_checkpoint)
 
     def save_pretrained(self, output_dir: str | Path) -> None:
         output_dir = Path(output_dir)
@@ -175,3 +181,112 @@ running controlled evaluation.
         if unnormalize:
             action = self.normalizer.unnormalize_actions(action[:, None, :])[:, 0]
         return {"action": action}
+
+
+class MiniVLARefinedPolicyRunner(MiniVLAPolicyRunner):
+    """Inference wrapper that applies a trained post-SFT refinement stack."""
+
+    def __init__(
+        self,
+        policy: MiniVLAPolicy,
+        processor: MiniVLAProcessor,
+        normalizer: BatchNormalizer,
+        refinement: PostSFTRefinementStack,
+        device: torch.device | str,
+        assets: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(policy, processor, normalizer, device=device, assets=assets)
+        self.refinement = refinement.to(self.device)
+        self.refinement.eval()
+
+    @classmethod
+    def from_runner(
+        cls,
+        runner: MiniVLAPolicyRunner,
+        refinement_checkpoint: str | Path,
+    ) -> "MiniVLARefinedPolicyRunner":
+        refinement = PostSFTRefinementStack.from_checkpoint(
+            refinement_checkpoint,
+            runner.policy.config,
+            map_location=runner.device,
+        ).to(runner.device)
+        assets = dict(runner.assets)
+        assets["refinement_checkpoint"] = str(refinement_checkpoint)
+        return cls(
+            runner.policy,
+            runner.processor,
+            runner.normalizer,
+            refinement,
+            device=runner.device,
+            assets=assets,
+        )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str | Path,
+        refinement_checkpoint: str | Path,
+        device: torch.device | str | None = None,
+    ) -> "MiniVLARefinedPolicyRunner":
+        base_runner = MiniVLAPolicyRunner.from_checkpoint(checkpoint_path, device=device)
+        return cls.from_runner(base_runner, refinement_checkpoint)
+
+    def save_pretrained(self, output_dir: str | Path) -> None:
+        super().save_pretrained(output_dir)
+        output_dir = Path(output_dir)
+        self.refinement.save_pretrained(
+            output_dir,
+            base_checkpoint=self.assets.get("base_checkpoint"),
+            assets={"runner_assets": self.assets},
+        )
+
+    @torch.no_grad()
+    def infer(
+        self,
+        observation: dict[str, Any],
+        num_steps: int | None = None,
+        unnormalize: bool = True,
+        apply_residual: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        batch = prepare_batch(
+            observation,
+            self.policy.config,
+            self.processor,
+            self.normalizer,
+            device=self.device,
+            require_action=False,
+        )
+        obs_tokens = self.policy.encode_observation_tokens(batch)
+        actions = self.policy.predict_action_chunk(batch, num_steps=num_steps)
+        refinement_out = self.refinement(obs_tokens.float(), actions.float())
+        refined_actions = refinement_out.get("refined_actions", actions[..., : self.policy.config.action_dim])
+        if apply_residual:
+            actions = refined_actions
+        else:
+            actions = actions[..., : self.policy.config.action_dim]
+        if unnormalize:
+            actions = self.normalizer.unnormalize_actions(actions)
+        result = {"actions": actions}
+        if "probe" in refinement_out:
+            result["failure_probability"] = refinement_out["probe"]["failure_probability"]
+        if "verifier" in refinement_out:
+            result["safety_probability"] = refinement_out["verifier"]["safety_probability"]
+            result["advantage"] = refinement_out["verifier"]["advantage"]
+        if "horizon" in refinement_out:
+            result["horizon"] = refinement_out["horizon"]["horizon"]
+            result["expected_horizon"] = refinement_out["horizon"]["expected_horizon"]
+        return result
+
+    @torch.no_grad()
+    def select_action(
+        self,
+        observation: dict[str, Any],
+        unnormalize: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        result = self.infer(observation, unnormalize=unnormalize)
+        action = result["actions"][:, 0]
+        out = {"action": action}
+        for key in ("failure_probability", "safety_probability", "horizon", "expected_horizon"):
+            if key in result:
+                out[key] = result[key]
+        return out

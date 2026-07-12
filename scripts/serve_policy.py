@@ -47,6 +47,9 @@ class PolicyHandler(BaseHTTPRequestHandler):
         else:
             result = self.runner.infer(_json_to_batch(payload), num_steps=num_steps)
             response = {"actions": _tensor_to_json(result["actions"])}
+        for key in ("failure_probability", "safety_probability", "advantage", "horizon", "expected_horizon"):
+            if key in result:
+                response[key] = _tensor_to_json(result[key])
         body = json.dumps(response).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -58,12 +61,17 @@ class PolicyHandler(BaseHTTPRequestHandler):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve a MiniVLA checkpoint over a small HTTP API.")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--refinement-checkpoint", default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8010)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    PolicyHandler.runner = MiniVLAPolicyRunner.from_checkpoint(args.checkpoint, device=args.device)
+    PolicyHandler.runner = MiniVLAPolicyRunner.from_checkpoint(
+        args.checkpoint,
+        device=args.device,
+        refinement_checkpoint=args.refinement_checkpoint,
+    )
     server = ThreadingHTTPServer((args.host, args.port), PolicyHandler)
     print(f"serving MiniVLA policy on http://{args.host}:{args.port}/infer", flush=True)
     server.serve_forever()

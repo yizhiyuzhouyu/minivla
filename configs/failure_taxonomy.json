@@ -1,0 +1,30 @@
+{
+  "action_instability": {
+    "description": "Abrupt action jumps, high jerk, or unstable chunk boundaries.",
+    "signals": ["mean_action_jerk", "command_jump_ratio", "max_abs_delta"]
+  },
+  "action_saturation": {
+    "description": "Commands repeatedly hit clamp or joint limits.",
+    "signals": ["action_saturation_ratio", "joint_limit_projection"]
+  },
+  "visual_ood": {
+    "description": "Observation is outside the visual distribution used for SFT.",
+    "signals": ["operator_label", "high_loss_cluster", "image_condition"]
+  },
+  "language_mismatch": {
+    "description": "Task or subtask label does not match the demonstrated behavior.",
+    "signals": ["task", "subtask.label", "operator_label"]
+  },
+  "grasp_lost": {
+    "description": "Object was grasped and then lost during transport or manipulation.",
+    "signals": ["operator_label", "episode.success", "gripper_state"]
+  },
+  "contact_failure": {
+    "description": "Policy fails at contact-rich insertion, pushing, or fine alignment.",
+    "signals": ["operator_label", "force_or_tactile_signal", "high_jerk"]
+  },
+  "recovery_failure": {
+    "description": "Policy cannot return to a valid task state after perturbation or drift.",
+    "signals": ["operator_label", "failure_probability", "recovery_attempt_count"]
+  }
+}

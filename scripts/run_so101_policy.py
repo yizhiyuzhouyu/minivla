@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from minivla.postprocess import ActionPostProcessor, LatencyMonitor, PostProcessConfig
 
 
 def load_json(path: str | None) -> dict[str, Any]:
@@ -35,60 +40,6 @@ def post_policy(url: str, payload: dict[str, Any], timeout: float) -> torch.Tens
     if "action" in result:
         return torch.as_tensor(result["action"], dtype=torch.float32)
     raise KeyError("Policy response must contain 'actions' or 'action'")
-
-
-class EMASmoother:
-    def __init__(self, alpha: float) -> None:
-        if not 0.0 <= alpha <= 1.0:
-            raise ValueError("EMA alpha must be in [0, 1]")
-        self.alpha = alpha
-        self.value: torch.Tensor | None = None
-
-    def __call__(self, action: torch.Tensor) -> torch.Tensor:
-        if self.value is None:
-            self.value = action.clone()
-        else:
-            self.value = self.alpha * action + (1.0 - self.alpha) * self.value
-        return self.value.clone()
-
-
-class ActionSafetyFilter:
-    def __init__(
-        self,
-        action_min: float,
-        action_max: float,
-        max_delta: float | None,
-        joint_min: float | None,
-        joint_max: float | None,
-        action_mode: str,
-    ) -> None:
-        self.action_min = action_min
-        self.action_max = action_max
-        self.max_delta = max_delta
-        self.joint_min = joint_min
-        self.joint_max = joint_max
-        self.action_mode = action_mode
-        self.prev_action: torch.Tensor | None = None
-
-    def __call__(self, action: torch.Tensor, current_joints: torch.Tensor | None = None) -> torch.Tensor:
-        action = action.clamp(self.action_min, self.action_max)
-        if self.max_delta is not None and self.prev_action is not None:
-            delta = (action - self.prev_action).clamp(-self.max_delta, self.max_delta)
-            action = self.prev_action + delta
-        if current_joints is not None and self.joint_min is not None and self.joint_max is not None:
-            if self.action_mode == "delta":
-                next_joints = current_joints + action[: current_joints.numel()]
-            else:
-                next_joints = action[: current_joints.numel()]
-            next_joints = next_joints.clamp(self.joint_min, self.joint_max)
-            if self.action_mode == "delta":
-                action = action.clone()
-                action[: current_joints.numel()] = next_joints - current_joints
-            else:
-                action = action.clone()
-                action[: current_joints.numel()] = next_joints
-        self.prev_action = action.clone()
-        return action
 
 
 class SO101Adapter:
@@ -134,19 +85,21 @@ def main() -> None:
     args = parser.parse_args()
 
     period = 1.0 / args.hz
-    smoother = EMASmoother(args.ema_alpha)
-    safety = ActionSafetyFilter(
-        action_min=args.action_min,
-        action_max=args.action_max,
-        max_delta=args.max_delta,
-        joint_min=args.joint_min,
-        joint_max=args.joint_max,
-        action_mode=args.action_mode,
+    postprocessor = ActionPostProcessor(
+        PostProcessConfig(
+            action_min=args.action_min,
+            action_max=args.action_max,
+            max_delta=args.max_delta,
+            joint_min=args.joint_min,
+            joint_max=args.joint_max,
+            action_mode=args.action_mode,
+            ema_alpha=args.ema_alpha,
+        )
     )
+    latency = LatencyMonitor()
     adapter = SO101Adapter()
     static_observation = load_json(args.observation_json)
 
-    latencies_ms: list[float] = []
     for cycle in range(args.max_cycles):
         if should_stop(args.stop_file):
             print(f"stop_file_detected={args.stop_file}")
@@ -168,35 +121,28 @@ def main() -> None:
         if args.server_select_action:
             payload["select_action"] = True
         actions = post_policy(args.policy_url, payload, timeout=args.request_timeout)
-        if actions.ndim == 3:
-            action = actions[0, 0]
-        elif actions.ndim == 2:
-            if args.server_select_action:
-                action = actions[0]
-            else:
-                action = actions[0]
-        elif actions.ndim == 1:
-            action = actions
-        else:
-            raise ValueError(f"Expected policy action tensor, got {tuple(actions.shape)}")
-
-        action = smoother(action)
-        action = safety(action, current_joints=current_joints)
+        action = postprocessor.select_action(actions)
+        action, post_info = postprocessor(action, current_joints=current_joints)
 
         if args.dry_run:
-            print(f"cycle={cycle} action={action.tolist()}")
+            print(f"cycle={cycle} action={action.tolist()} postprocess={post_info.to_dict()}")
         else:
             adapter.write_action(action)
 
         elapsed = time.perf_counter() - start
-        latencies_ms.append(elapsed * 1000.0)
+        latency.record(elapsed)
         sleep_s = period - elapsed
         if sleep_s > 0:
             time.sleep(sleep_s)
 
-    if latencies_ms:
-        mean_ms = sum(latencies_ms) / len(latencies_ms)
-        print(f"cycles={len(latencies_ms)} mean_loop_ms={mean_ms:.3f} mean_hz={1000.0 / mean_ms:.2f}")
+    summary = latency.summary()
+    if summary["count"]:
+        print(
+            f"cycles={summary['count']} "
+            f"mean_loop_ms={summary['mean_ms']:.3f} "
+            f"mean_hz={summary['mean_hz']:.2f} "
+            f"max_loop_ms={summary['max_ms']:.3f}"
+        )
 
 
 if __name__ == "__main__":

@@ -32,6 +32,12 @@ def create_sinusoidal_pos_embedding(
     return torch.cat([torch.sin(sinusoid), torch.cos(sinusoid)], dim=1).to(torch.float32)
 
 
+def action_smoothness_loss(actions: Tensor) -> Tensor:
+    if actions.shape[1] < 2:
+        return torch.zeros((), dtype=actions.dtype, device=actions.device)
+    return (actions[:, 1:] - actions[:, :-1]).abs().mean()
+
+
 class DiTActionExpert(nn.Module):
     """DiT-style velocity network used inside the flow-matching head."""
 
@@ -154,11 +160,20 @@ class FMHead(nn.Module):
         else:
             raise ValueError(f"Unsupported reduction: {reduction}")
 
+        smoothness_loss = None
+        if self.config.fm_action_smoothness_loss_weight > 0:
+            x0_pred = x_t - time[:, None, None].to(actions.dtype) * pred_velocity
+            smoothness_loss = action_smoothness_loss(x0_pred[..., :action_dim])
+            if reduction == "mean":
+                loss = loss + self.config.fm_action_smoothness_loss_weight * smoothness_loss
+
         info = {
             "loss": loss.detach() if isinstance(loss, Tensor) else float(loss),
             "fm_time_mean": time.detach().mean(),
             "fm_noise_std": noise.detach().float().std(),
         }
+        if smoothness_loss is not None:
+            info["fm_action_smoothness_loss"] = smoothness_loss
         return loss, info
 
     @torch.no_grad()

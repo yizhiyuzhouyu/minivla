@@ -30,6 +30,7 @@ hidden_dim: 256
 num_heads: 8
 num_dit_layers: 4
 action_head: flow_matching
+n_obs_steps: 2
 chunk_size: 50
 n_action_steps: 25
 max_state_dim: 32

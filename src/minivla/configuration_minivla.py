@@ -57,6 +57,7 @@ class MiniVLAConfig:
     time_sampling_offset: float = 0.001
     min_period: float = 4e-3
     max_period: float = 4.0
+    fm_action_smoothness_loss_weight: float = 0.0
 
     device: str | None = None
     dtype: str = "float32"
@@ -68,6 +69,8 @@ class MiniVLAConfig:
             raise ValueError(
                 f"n_action_steps ({self.n_action_steps}) cannot exceed chunk_size ({self.chunk_size})"
             )
+        if self.n_obs_steps <= 0:
+            raise ValueError("n_obs_steps must be positive")
         if self.max_state_dim <= 0 or self.max_action_dim <= 0:
             raise ValueError("max_state_dim and max_action_dim must be positive")
         if self.action_dim is None:
@@ -90,5 +93,7 @@ class MiniVLAConfig:
             raise ValueError("temporal_ensemble_max_chunks must be positive")
         if self.temporal_ensemble_decay < 0:
             raise ValueError("temporal_ensemble_decay must be non-negative")
+        if self.fm_action_smoothness_loss_weight < 0:
+            raise ValueError("fm_action_smoothness_loss_weight must be non-negative")
         if self.dtype not in {"float32", "bfloat16"}:
             raise ValueError("dtype must be 'float32' or 'bfloat16'")
