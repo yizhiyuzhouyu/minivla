@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "minivla"
+name = "minivla-rhf-sac"
 version = "0.1.0"
-description = "A compact LeRobot-compatible VLA policy with CLIP/ViT vision, pooled text, proprioception, and DiT flow-matching action expert."
+description = "A compact LeRobot-compatible MiniVLA stack with RHF reward modeling and residual SAC post-training."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

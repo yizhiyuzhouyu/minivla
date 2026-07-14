@@ -71,6 +71,23 @@ def scalar_or_list(value: Any) -> Any:
     return value
 
 
+def json_safe(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if hasattr(value, "tolist"):
+        try:
+            return value.tolist()
+        except TypeError:
+            return str(value)
+    return str(value)
+
+
 def should_stop(stop_file: str | None) -> bool:
     return stop_file is not None and Path(stop_file).exists()
 
@@ -89,7 +106,16 @@ def main() -> None:
     parser.add_argument("--stop-file", default="/tmp/minivla_stop")
     parser.add_argument("--human-label", default=None, help="Optional label applied to every logged step.")
     parser.add_argument("--episode-id", default=None)
+    parser.add_argument("--trajectory-id", default=None)
     parser.add_argument("--operator", default=None)
+    parser.add_argument("--save-observation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--video-path", default=None)
+    parser.add_argument("--video-key", default="video_path")
+    parser.add_argument("--success", type=float, default=None)
+    parser.add_argument("--stable-grasp", type=float, default=None)
+    parser.add_argument("--collision-free", type=float, default=None)
+    parser.add_argument("--smooth-action", type=float, default=None)
+    parser.add_argument("--quality-score", type=float, default=None)
 
     parser.add_argument("--ema-alpha", type=float, default=0.35)
     parser.add_argument("--action-min", type=float, default=-1.0)
@@ -151,6 +177,7 @@ def main() -> None:
                 "time": time.time(),
                 "cycle": cycle,
                 "episode_id": args.episode_id,
+                "trajectory_id": args.trajectory_id or args.episode_id,
                 "operator": args.operator,
                 "human_label": args.human_label,
                 "observation_keys": sorted(observation.keys()),
@@ -165,6 +192,21 @@ def main() -> None:
                 "latency_ms": latency_ms,
                 "dry_run": args.dry_run,
             }
+            if args.save_observation:
+                record["observation"] = json_safe(observation)
+            video_path = args.video_path or observation.get(args.video_key)
+            if video_path is not None:
+                record["video"] = {"path": str(video_path)}
+            labels = {
+                "success": args.success,
+                "stable_grasp": args.stable_grasp,
+                "collision_free": args.collision_free,
+                "smooth_action": args.smooth_action,
+                "quality_score": args.quality_score,
+            }
+            labels = {key: value for key, value in labels.items() if value is not None}
+            if labels:
+                record["labels"] = labels
             handle.write(json.dumps(record) + "\n")
             handle.flush()
             print(f"cycle={cycle} logged={output} latency_ms={latency_ms:.3f}")

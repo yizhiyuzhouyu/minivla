@@ -2,7 +2,7 @@ from minivla.action_heads import MLPActionHead, QueryActionHead
 from minivla.configuration_minivla import MiniVLAConfig
 from minivla.fm_head import FMHead
 from minivla.modeling_minivla import MiniVLAPolicy
-from minivla.policy import MiniVLARefinedPolicyRunner, MiniVLAPolicyRunner
+from minivla.policy import MiniVLARHFSACPolicyRunner, MiniVLARefinedPolicyRunner, MiniVLAPolicyRunner
 from minivla.postprocess import ActionPostProcessor, LatencyMonitor, PostProcessConfig
 from minivla.processor import MiniVLAProcessor
 from minivla.refinement_heads import (
@@ -12,6 +12,15 @@ from minivla.refinement_heads import (
     PostSFTRefinementStack,
     RefinementConfig,
     ResidualRecoveryPolicy,
+)
+from minivla.rhf_sac import (
+    RHFSACAgent,
+    RewardModelConfig,
+    ResidualSACActor,
+    RolloutWindowDataset,
+    SACConfig,
+    SACQNetwork,
+    TrajectoryRewardModel,
 )
 from minivla.splits import load_episode_split
 from minivla.transforms import BatchNormalizer, prepare_batch
@@ -27,14 +36,22 @@ __all__ = [
     "MLPActionHead",
     "MiniVLAConfig",
     "MiniVLAPolicy",
+    "MiniVLARHFSACPolicyRunner",
     "MiniVLARefinedPolicyRunner",
     "MiniVLAPolicyRunner",
     "MiniVLAProcessor",
     "PostSFTRefinementStack",
     "PostProcessConfig",
     "QueryActionHead",
+    "RHFSACAgent",
     "RefinementConfig",
+    "ResidualSACActor",
     "ResidualRecoveryPolicy",
+    "RewardModelConfig",
+    "RolloutWindowDataset",
+    "SACConfig",
+    "SACQNetwork",
+    "TrajectoryRewardModel",
     "load_episode_split",
     "prepare_batch",
 ]

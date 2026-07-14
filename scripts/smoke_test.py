@@ -5,7 +5,16 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from minivla import MiniVLAConfig, MiniVLAPolicy, PostSFTRefinementStack, RefinementConfig
+from minivla import (
+    MiniVLAConfig,
+    MiniVLAPolicy,
+    PostSFTRefinementStack,
+    RefinementConfig,
+    RHFSACAgent,
+    RewardModelConfig,
+    SACConfig,
+    TrajectoryRewardModel,
+)
 from minivla.constants import (
     ACTION,
     ACTION_IS_PAD,
@@ -84,6 +93,30 @@ def main() -> None:
         ),
     )
     refinement_out = refinement(obs_tokens, action_chunk)
+    reward_model = TrajectoryRewardModel(cfg, RewardModelConfig(hidden_dim=32, num_layers=1))
+    reward_out = reward_model(obs_tokens.float(), action_chunk.float())
+    reward_loss, reward_logs = reward_model.loss(
+        reward_out,
+        {
+            "reward_target": torch.tensor([1.0, 0.25]),
+            "success": torch.tensor([1.0, 0.0]),
+            "stable_grasp": torch.tensor([1.0, 0.0]),
+            "collision_free": torch.tensor([1.0, 1.0]),
+            "smooth_action": torch.tensor([0.5, 0.0]),
+        },
+    )
+    sac_agent = RHFSACAgent(
+        cfg,
+        SACConfig(
+            actor_hidden_dim=32,
+            critic_hidden_dim=32,
+            actor_layers=1,
+            critic_layers=1,
+            residual_scale=0.1,
+        ),
+    )
+    sac_actions, sac_log_prob, sac_residual = sac_agent.actor.sample(obs_tokens.float(), action_chunk.float())
+    sac_q = sac_agent.q1(obs_tokens.float(), sac_actions.float())
 
     assert torch.isfinite(loss)
     assert loss_none.shape[-1] == cfg.action_dim
@@ -98,6 +131,13 @@ def main() -> None:
     assert refinement_out["verifier"]["safety_probability"].shape == (2,)
     assert refinement_out["horizon"]["horizon"].shape == (2,)
     assert refinement_out["refined_actions"].shape == (2, cfg.chunk_size, cfg.action_dim)
+    assert reward_out["reward"].shape == (2,)
+    assert torch.isfinite(reward_loss)
+    assert reward_logs["loss"] >= 0
+    assert sac_actions.shape == (2, cfg.chunk_size, cfg.action_dim)
+    assert sac_log_prob.shape == (2,)
+    assert sac_residual.shape == (2, cfg.chunk_size, cfg.action_dim)
+    assert sac_q.shape == (2,)
 
     for action_head in ("mlp", "query"):
         head_cfg = MiniVLAConfig(

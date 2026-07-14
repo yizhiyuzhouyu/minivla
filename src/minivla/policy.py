@@ -12,6 +12,7 @@ from minivla.configuration_minivla import MiniVLAConfig
 from minivla.modeling_minivla import MiniVLAPolicy
 from minivla.processor import MiniVLAProcessor
 from minivla.refinement_heads import PostSFTRefinementStack
+from minivla.rhf_sac import RHFSACAgent
 from minivla.transforms import BatchNormalizer, prepare_batch
 
 
@@ -44,7 +45,10 @@ class MiniVLAPolicyRunner:
         checkpoint_path: str | Path,
         device: torch.device | str | None = None,
         refinement_checkpoint: str | Path | None = None,
+        sac_checkpoint: str | Path | None = None,
     ) -> "MiniVLAPolicyRunner":
+        if refinement_checkpoint is not None and sac_checkpoint is not None:
+            raise ValueError("Use either refinement_checkpoint or sac_checkpoint; composing both is not supported yet")
         checkpoint_path = Path(checkpoint_path)
         if checkpoint_path.is_dir():
             checkpoint_path = checkpoint_path / "policy.pt"
@@ -66,6 +70,8 @@ class MiniVLAPolicyRunner:
             normalize_action=bool(normalizer_assets.get("normalize_action", assets.get("normalize_action", True))),
         )
         runner = cls(policy, processor, normalizer, device=device, assets=assets)
+        if sac_checkpoint is not None:
+            return MiniVLARHFSACPolicyRunner.from_runner(runner, sac_checkpoint)
         if refinement_checkpoint is not None:
             return MiniVLARefinedPolicyRunner.from_runner(runner, refinement_checkpoint)
         return runner
@@ -76,8 +82,14 @@ class MiniVLAPolicyRunner:
         pretrained_path: str | Path,
         device: torch.device | str | None = None,
         refinement_checkpoint: str | Path | None = None,
+        sac_checkpoint: str | Path | None = None,
     ) -> "MiniVLAPolicyRunner":
-        return cls.from_checkpoint(pretrained_path, device=device, refinement_checkpoint=refinement_checkpoint)
+        return cls.from_checkpoint(
+            pretrained_path,
+            device=device,
+            refinement_checkpoint=refinement_checkpoint,
+            sac_checkpoint=sac_checkpoint,
+        )
 
     def save_pretrained(self, output_dir: str | Path) -> None:
         output_dir = Path(output_dir)
@@ -290,3 +302,96 @@ class MiniVLARefinedPolicyRunner(MiniVLAPolicyRunner):
             if key in result:
                 out[key] = result[key]
         return out
+
+
+class MiniVLARHFSACPolicyRunner(MiniVLAPolicyRunner):
+    """Inference wrapper that applies a trained residual SAC actor."""
+
+    def __init__(
+        self,
+        policy: MiniVLAPolicy,
+        processor: MiniVLAProcessor,
+        normalizer: BatchNormalizer,
+        sac_agent: RHFSACAgent,
+        device: torch.device | str,
+        assets: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(policy, processor, normalizer, device=device, assets=assets)
+        self.sac_agent = sac_agent.to(self.device)
+        self.sac_agent.eval()
+
+    @classmethod
+    def from_runner(
+        cls,
+        runner: MiniVLAPolicyRunner,
+        sac_checkpoint: str | Path,
+    ) -> "MiniVLARHFSACPolicyRunner":
+        sac_agent = RHFSACAgent.from_checkpoint(sac_checkpoint, runner.policy.config, map_location=runner.device)
+        assets = dict(runner.assets)
+        assets["sac_checkpoint"] = str(sac_checkpoint)
+        return cls(
+            runner.policy,
+            runner.processor,
+            runner.normalizer,
+            sac_agent,
+            device=runner.device,
+            assets=assets,
+        )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint_path: str | Path,
+        sac_checkpoint: str | Path,
+        device: torch.device | str | None = None,
+    ) -> "MiniVLARHFSACPolicyRunner":
+        base_runner = MiniVLAPolicyRunner.from_checkpoint(checkpoint_path, device=device)
+        return cls.from_runner(base_runner, sac_checkpoint)
+
+    @torch.no_grad()
+    def infer(
+        self,
+        observation: dict[str, Any],
+        num_steps: int | None = None,
+        unnormalize: bool = True,
+        deterministic: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        batch = prepare_batch(
+            observation,
+            self.policy.config,
+            self.processor,
+            self.normalizer,
+            device=self.device,
+            require_action=False,
+        )
+        obs_tokens = self.policy.encode_observation_tokens(batch).float()
+        base_actions = self.policy.predict_action_chunk(batch, num_steps=num_steps).float()
+        actions, log_prob, residual = self.sac_agent.actor.sample(
+            obs_tokens,
+            base_actions,
+            deterministic=deterministic,
+        )
+        if unnormalize:
+            actions = self.normalizer.unnormalize_actions(actions)
+            base_actions = self.normalizer.unnormalize_actions(base_actions[..., : actions.shape[-1]])
+            residual = actions - base_actions
+        return {
+            "actions": actions,
+            "base_actions": base_actions[..., : actions.shape[-1]],
+            "sac_log_prob": log_prob,
+            "sac_residual": residual,
+        }
+
+    @torch.no_grad()
+    def select_action(
+        self,
+        observation: dict[str, Any],
+        unnormalize: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        result = self.infer(observation, unnormalize=unnormalize)
+        return {
+            "action": result["actions"][:, 0],
+            "base_action": result["base_actions"][:, 0],
+            "sac_log_prob": result["sac_log_prob"],
+            "sac_residual": result["sac_residual"][:, 0],
+        }

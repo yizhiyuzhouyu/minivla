@@ -1,7 +1,8 @@
-# MiniVLA
+# MiniVLA-RHF-SAC
 
-MiniVLA is a pi0-style compact VLA stack for SO-101: patch-token observation
-memory + Flow Matching Action Expert + LeRobot training/deployment loop.
+MiniVLA-RHF-SAC is a compact SO-101 VLA stack: MiniVLA base policy, SFT/BC,
+rollout logging, trajectory-label reward modeling, and residual SAC
+post-training.
 
 MiniVLA is a compact LeRobot-compatible VLA policy project for SO-101 style
 robot experiments. The goal is not to reproduce the full scale of pi0/openpi,
@@ -77,6 +78,8 @@ Key code paths:
 - Post-SFT calibration: `scripts/post_sft_calibrate.py`
 - Post-SFT refinement head training: `scripts/train_refinement_heads.py`
 - Post-SFT refinement evaluation: `scripts/evaluate_refinement_heads.py`
+- RHF reward model training: `scripts/train_reward_model.py`
+- RHF residual SAC training: `scripts/train_sac.py`
 - Rollout logger: `scripts/log_rollout.py`
 - Policy server: `scripts/serve_policy.py`
 - Robot client scaffold: `scripts/run_so101_policy.py`
@@ -207,9 +210,72 @@ start the same server and pass:
 /home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/run_so101_policy.py \
   --policy-url http://127.0.0.1:8010/infer \
   --observation-json path/to/so101_observation.json \
-  --server-select-action \
-  --dry-run
+    --server-select-action \
+    --dry-run
 ```
+
+## MiniVLA-RHF-SAC
+
+`minivla-rhf-sac` keeps the base MiniVLA SFT path intact and adds a robot-data
+post-training loop:
+
+```text
+MiniVLA base -> SFT/BC -> SO-101 rollout -> trajectory labels
+             -> reward model -> residual SAC -> new rollouts
+```
+
+The rollout logger can now store the observation, action, video pointer, and
+trajectory-level labels needed by RHF:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/log_rollout.py \
+  --policy-url http://127.0.0.1:8010/infer \
+  --output outputs/rollouts/task_a.jsonl \
+  --episode-id task_a_0001 \
+  --trajectory-id task_a_0001 \
+  --save-observation \
+  --success 1 \
+  --stable-grasp 1 \
+  --collision-free 1 \
+  --smooth-action 1
+```
+
+For human review, labels can also be supplied later as JSONL records keyed by
+`trajectory_id` or `episode_id`. Supported labels are `success`,
+`stable_grasp`, `collision_free`, `smooth_action`, and `human_score`.
+
+Train the reward model from labeled rollouts:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train_reward_model.py \
+  --base-checkpoint outputs/so101_pi0_like/best.pt \
+  --rollout-jsonl outputs/rollouts \
+  --labels-jsonl outputs/labels.jsonl \
+  --output-dir outputs/minivla_rhf_sac/reward_model
+```
+
+Train residual SAC against the frozen base policy and learned reward:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/train_sac.py \
+  --base-checkpoint outputs/so101_pi0_like/best.pt \
+  --reward-checkpoint outputs/minivla_rhf_sac/reward_model/reward_model.pt \
+  --rollout-jsonl outputs/rollouts \
+  --output-dir outputs/minivla_rhf_sac/sac
+```
+
+Serve the SAC-refined policy:
+
+```bash
+/home/yzyzy/miniconda3/envs/lerobot/bin/python scripts/serve_policy.py \
+  --checkpoint outputs/so101_pi0_like/best.pt \
+  --sac-checkpoint outputs/minivla_rhf_sac/sac/sac.pt \
+  --port 8010
+```
+
+The SAC layer is a bounded residual actor around MiniVLA's action chunk, with a
+BC regularizer during training. This is intentional: it lets real SO-101 data
+improve execution quality without immediately replacing the SFT policy.
 
 ## Evaluation Tools
 
